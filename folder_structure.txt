@@ -1,0 +1,38 @@
+.
+├── data
+│   ├── medical_data
+│   │   ├── base
+│   │   │   ├── base_model.csv
+│   │   │   └── human_body_knowledge_graph.ttl
+│   │   ├── n1
+│   │   │   └── client_1_CirculatorySystem_66_percent.csv
+│   │   ├── n2
+│   │   │   └── client_2_CirculatorySystem_100_percent.csv
+│   │   ├── n3
+│   │   │   └── client_3_ImmuneSystem_50_percent.csv
+│   │   ├── n4
+│   │   │   └── client_4_ImmuneSystem_75_percent.csv
+│   │   ├── n5
+│   │   │   └── client_5_ReproductiveSystem_100_percent.csv
+│   │   ├── n6
+│   │   │   └── client_6_IntegumentarySystem_80_percent.csv
+│   │   ├── n7
+│   │   │   └── client_7_noise_all_zero.csv
+│   │   ├── n8
+│   │   │   └── client_8_noise_50_percent.csv
+│   │   ├── n9
+│   │   │   └── client_9_noise_100_percent.csv
+│   │   ├── n10
+│   │   │   └── client_10_random.csv
+│   │   └── medical_data.zip
+├── src
+│   ├── Client
+│   │   └── client.py
+│   ├── DataHandler
+│   │   ├── __init__.py
+│   │   └── dataloader.py
+│   └── model
+│       ├── __init__.py
+│       └── model.py
+├── .gitattributes
+└── .gitignore

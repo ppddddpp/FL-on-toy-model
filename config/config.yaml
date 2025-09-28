@@ -1,0 +1,32 @@
+# Training parameters
+epochs:    50
+patience:  10
+batch_size: 4
+lr:        2e-5
+
+# Model parameters
+max_seq_len: 128
+ffn_dim: 128
+num_heads: 2
+model_dim: 64
+dropout: 0.1
+num_layers: 1
+
+# Knowledge graph parameters
+kg_model: "TransE"         # options: TransE | TransH | RotatE | CompGCN
+kg_method: "cosine"
+kg_emb_dim: 128
+kg_epochs: 50
+kg_mode: "hybrid"
+
+# CompGCN-specific
+kg_num_layers: 3
+kg_dropout: 0.25
+kg_opn: "corr"              # options: corr | sub | mult
+
+# Loss parameters
+cls_weight: 2.0
+kg_weight: 0.3
+
+# Wandb parameters
+project_name: "fl-toy-experiments"
