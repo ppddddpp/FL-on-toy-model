@@ -35,6 +35,5 @@ def main():
     test_acc = trainer.evaluate(split="test")
     print(f"Final Test Accuracy: {test_acc:.4f}")
 
-
 if __name__ == "__main__":
     main()
