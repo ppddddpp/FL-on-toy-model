@@ -28,7 +28,7 @@ class DatasetBuilder:
         return vocab
 
     @staticmethod
-    def load_csv(path, text_col="disease information", label_col="system"):
+    def load_csv(path, text_col="Disease_Informatio", label_col="Body_System"):
         texts, labels = [], []
         with open(path, newline="", encoding="utf-8-sig") as f:  # utf-8-sig handles BOM
             reader = csv.DictReader(f)
