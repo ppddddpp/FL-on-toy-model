@@ -5,7 +5,7 @@ batch_size: 4
 lr:        2e-5
 
 # Model parameters
-max_seq_len: 128
+max_seq_len: 512
 ffn_dim: 128
 num_heads: 2
 model_dim: 64
@@ -18,6 +18,10 @@ kg_method: "cosine"
 kg_emb_dim: 128
 kg_epochs: 50
 kg_mode: "hybrid"
+kg_neg_samples: 32
+kg_lr : 1e-3
+adv_temp: 0.5
+kg_margin: 1.0
 
 # CompGCN-specific
 kg_num_layers: 3

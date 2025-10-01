@@ -25,6 +25,10 @@ class Config:
     kg_emb_dim: int = 300
     kg_epochs: int = 30
     kg_mode: str = "hybrid"           # options: dataset | ontology | hybrid
+    kg_lr : float = 5e-4
+    kg_neg_samples: int = 8
+    kg_margin: float = 5.0
+    adv_temp: float = 0.5
 
     # CompGCN-specific (only used if kg_model=CompGCN)
     kg_num_layers: int = 2

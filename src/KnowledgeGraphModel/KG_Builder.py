@@ -1,4 +1,6 @@
 import rdflib
+from pathlib import Path
+from Helpers.Helpers import clean_ttl_file
 
 class KGBuilder:
     """
@@ -28,8 +30,11 @@ class KGBuilder:
 
     def build(self):
         """Parse the .ttl file and build ID-based triples."""
+        cleaned_path = str(Path(self.ttl_path).with_suffix(".cleaned.ttl"))
+        clean_ttl_file(self.ttl_path, cleaned_path)
+
         # Parse TTL
-        self.graph.parse(self.ttl_path, format="turtle")
+        self.graph.parse(cleaned_path, format="turtle")
 
         for s, p, o in self.graph:
             s, p, o = str(s), str(p), str(o)

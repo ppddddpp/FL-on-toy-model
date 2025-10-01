@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from .compgcn_conv import CompGCNConv
+from collections import defaultdict
+import torch.nn.functional as F
 import wandb
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -62,21 +64,37 @@ class TransHModel(BaseKGEModel):
     
 class RotatEModel(BaseKGEModel):
     def __init__(self, n_nodes, n_rels, emb_dim=200):
-        super().__init__(n_nodes, n_rels, emb_dim*2)  # use 2x dim for complex space
+        super().__init__(n_nodes, n_rels, emb_dim * 2)  # use 2x dim for complex space
         self.emb_dim = emb_dim
+        self.higher_better = False  # RotatE uses distance (lower is better)
 
-    def score(self, s_idx, r_idx, o_idx):
+    def normalize_entities(self):
+        with torch.no_grad():
+            w = self.ent.weight.data  # shape [n, emb_dim*2]
+            # use reshape (safe for non-contiguous tensors) to shape into complex pairs
+            w_c = w.reshape(-1, self.emb_dim, 2)   # [n, emb_dim, 2]
+            mag = torch.sqrt((w_c**2).sum(dim=-1, keepdim=True)).clamp(min=1e-9)  # [n,emb_dim,1]
+            w_c = w_c / mag
+            self.ent.weight.data = w_c.reshape_as(w)
+
+    def forward(self, s_idx, r_idx, o_idx):
+        # ensure normalization every time we fetch embeddings
+        self.normalize_entities()
+
         # reshape to complex numbers
         e_s = torch.view_as_complex(self.ent(s_idx).view(-1, self.emb_dim, 2))
         e_o = torch.view_as_complex(self.ent(o_idx).view(-1, self.emb_dim, 2))
         r = torch.view_as_complex(self.rel(r_idx).view(-1, self.emb_dim, 2))
 
-        # enforce unit modulus
+        # enforce unit modulus on relations
         r = r / torch.abs(r).clamp(min=1e-9)
 
         rotated = e_s * r
         diff = rotated - e_o
         return torch.norm(torch.view_as_real(diff), dim=(1, 2))
+
+    def score(self, s_idx, r_idx, o_idx):
+        return self.forward(s_idx, r_idx, o_idx)
 
 class CompGCNModel(nn.Module):
     def __init__(self, n_nodes, n_rels, emb_dim=200, num_layers=2,
@@ -140,7 +158,8 @@ class KGTrainer:
 
     def __init__(self, kg_dir: str = "kg", emb_dim: int = 200, joint_dim: Optional[int] = None, 
                     margin: float = 1.0, lr: float = 1e-3, curated_factor: float = 3.0, 
-                    device: Optional[str] = None, model_name: str = "TransE", model_kwargs=None):
+                    device: Optional[str] = None, model_name: str = "TransE",
+                    adv_temp: float = 1.0, clip_grad_norm: float = 5.0, weight_decay: float = 1e-5, model_kwargs=None):
         if kg_dir is None:
             self.kg_dir = KG_DIR
         else:
@@ -163,6 +182,10 @@ class KGTrainer:
         self.optimizer = None
         self.model_kwargs = model_kwargs or {}
         
+        self.adv_temp = adv_temp
+        self.clip_grad_norm = clip_grad_norm
+        self.weight_decay = weight_decay
+
         if self.joint_dim != self.emb_dim:
             self.proj_to_kg = nn.Linear(self.joint_dim, self.emb_dim, bias=False).to(self.device)
         else:
@@ -170,9 +193,12 @@ class KGTrainer:
 
     def load_maps(self):
         with (self.kg_dir / "node2id.json").open(encoding='utf8') as f:
-            self.node2id = json.load(f)
+            raw = json.load(f)
+            # ensure values are ints
+            self.node2id = {k: int(v) for k, v in raw.items()}
         with (self.kg_dir / "relation2id.json").open(encoding='utf8') as f:
-            self.rel2id = json.load(f)
+            raw = json.load(f)
+            self.rel2id = {k: int(v) for k, v in raw.items()}
 
     def load_triples(self, triples_csv: str = None):
         # default to kg/triples.csv
@@ -204,22 +230,46 @@ class KGTrainer:
 
         # build train-only arrays
         if self.model_name == "CompGCN":
+            # build directed lists
+            srcs = [t[0] for t in self.train_triples]
+            dsts = [t[2] for t in self.train_triples]
+
+            # create bidirectional edges (s->o and o->s)
             edge_index = torch.tensor(
-                [[t[0] for t in self.train_triples],
-                [t[2] for t in self.train_triples]],
-                dtype=torch.long, device=self.device
+                [srcs + dsts, dsts + srcs],
+                dtype=torch.long,
+                device=self.device
             )
             edge_type = torch.tensor(
-                [t[1] for t in self.train_triples],
-                dtype=torch.long, device=self.device
+                [t[1] for t in self.train_triples] + [t[1] for t in self.train_triples],
+                dtype=torch.long,
+                device=self.device
             )
             self.edge_index = edge_index
             self.edge_type = edge_type
-        
+                
         self.pos_s = np.array([t[0] for t in self.train_triples], dtype=np.int64)
         self.pos_r = np.array([t[1] for t in self.train_triples], dtype=np.int64)
         self.pos_o = np.array([t[2] for t in self.train_triples], dtype=np.int64)
         self.pos_conf = np.array([t[3] for t in self.train_triples], dtype=np.float32)
+
+        heads_per_rel = defaultdict(set)   # relation -> set(heads)
+        tails_per_rel = defaultdict(set)   # relation -> set(tails)
+        pair_count = defaultdict(int)      # (r) -> number of pairs
+
+        for s, r, o, *_ in self.train_triples:
+            heads_per_rel[r].add(s)
+            tails_per_rel[r].add(o)
+            pair_count[r] += 1
+
+        # compute bernoulli probabilities
+        self._bern_prob = {}
+        for r in range(len(self.rel2id)):
+            heads = len(heads_per_rel.get(r, [])) or 1
+            tails = len(tails_per_rel.get(r, [])) or 1
+            self._bern_prob[r] = float(np.clip(tails / (heads + tails), 0.05, 0.95))
+
+        print(f"[KGTrainer] computed bernoulli probs for {len(self._bern_prob)} relations")
 
         # init model
         n_nodes = len(self.node2id)
@@ -236,17 +286,18 @@ class KGTrainer:
         else:
             raise ValueError(f"Unknown KG model: {self.model_name}")
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
     def train(self,
             epochs: int = 5,
-            batch_size: int = 1024,
+            batch_size: int = 1024, 
             normalize: bool = True,
             save_every: int = 1,
             wandb_config: Optional[dict] = None,
             log_to_wandb: bool = True,
-            patience: Optional[int] = None,    # NEW: early stopping patience
-            metric: str = "mrr"                # NEW: which metric to monitor
+            patience: Optional[int] = None,
+            metric: str = "mrr",
+            num_negatives: Optional[int] = 4
             ):
         """
         Train KG TransE embeddings.
@@ -286,6 +337,12 @@ class KGTrainer:
         best_val = -float("inf")
         bad_epochs = 0
 
+        # build (s,r) -> {o} map for negatives filtering
+        all_triples = self.triples if getattr(self, "triples", None) else (self.train_triples + self.val_triples)
+        true_map = {}
+        for s, r, o, *_ in all_triples:
+            true_map.setdefault((s, r), set()).add(o)
+
         for epoch in tqdm(range(1, epochs + 1), desc="KG Train", unit="epoch"):
             idxs = np.arange(n)
             np.random.shuffle(idxs)
@@ -309,28 +366,155 @@ class KGTrainer:
                 else:
                     pos_scores = self.model.score(s_batch, r_batch, o_batch)
 
-                # negative sampling
-                corrupt_head = np.random.rand(len(batch_idx)) < 0.5
-                neg_s = self.pos_s[batch_idx].copy()
-                neg_o = self.pos_o[batch_idx].copy()
-                rand_nodes = np.random.randint(0, self.model.ent.num_embeddings, size=len(batch_idx))
-                neg_s[corrupt_head] = rand_nodes[corrupt_head]
-                neg_o[~corrupt_head] = rand_nodes[~corrupt_head]
-                neg_s_t = torch.LongTensor(neg_s).to(self.device)
-                neg_o_t = torch.LongTensor(neg_o).to(self.device)
+                # filtered negative sampling
+                neg_s_list, neg_r_list, neg_o_list = [], [], []
+                # precompute replacement probs for this batch from per-relation bernoulli
+                if getattr(self, "_bern_prob", None) is not None:
+                    probs = np.array([self._bern_prob[int(self.pos_r[i])] for i in batch_idx], dtype=np.float32)
+                else:
+                    probs = np.full(len(batch_idx), 0.5, dtype=np.float32)
+
+                for _ in range(num_negatives):
+                    # relation-aware decide which side to corrupt
+                    corrupt_head = np.random.rand(len(batch_idx)) < probs
+
+                    neg_s = self.pos_s[batch_idx].copy()
+                    neg_o = self.pos_o[batch_idx].copy()
+                    rand_nodes = np.random.randint(0, self.model.ent.num_embeddings, size=len(batch_idx))
+
+                    # reject if rand_nodes[j] is a known true object for (s,r)
+                    for j in range(len(batch_idx)):
+                        s_j = int(self.pos_s[batch_idx[j]])
+                        r_j = int(self.pos_r[batch_idx[j]])
+                        o_j = int(self.pos_o[batch_idx[j]])
+                        cand = int(rand_nodes[j])
+
+                        max_tries = 50
+                        tries = 0
+
+                        if corrupt_head[j]:
+                            # we will replace head -> ensure (cand, r_j) does NOT produce o_j
+                            forbidden = true_map.get((cand, r_j), set())
+                            while (o_j in forbidden) and tries < max_tries:
+                                cand = np.random.randint(0, self.model.ent.num_embeddings)
+                                forbidden = true_map.get((cand, r_j), set())
+                                tries += 1
+                        else:
+                            # we will replace tail/object -> ensure candidate is not in true objects for (s_j, r_j)
+                            forbidden = true_map.get((s_j, r_j), set())
+                            while (cand in forbidden) and tries < max_tries:
+                                cand = np.random.randint(0, self.model.ent.num_embeddings)
+                                tries += 1
+
+                        # final fallback if still problematic (rare)
+                        def _candidate_ok(candidate, replace_head, s_j_local, r_j_local, o_j_local):
+                            # When replacing the head, ensure the candidate head does NOT map to the same o_j via relation r_j_local.
+                            if replace_head:
+                                return o_j_local not in true_map.get((int(candidate), r_j_local), set())
+                            # When replacing the tail, make sure candidate is not in true objects for (s_j_local, r_j_local)
+                            return int(candidate) not in true_map.get((s_j_local, r_j_local), set())
+
+                        if not _candidate_ok(cand, corrupt_head[j], s_j, r_j, o_j):
+                            tries2 = 0
+                            # bounded search to avoid pathological infinite loops; 200 tries is large but safe
+                            while tries2 < 200:
+                                candidate = np.random.randint(0, self.model.ent.num_embeddings)
+                                if _candidate_ok(candidate, corrupt_head[j], s_j, r_j, o_j):
+                                    cand = int(candidate)
+                                    break
+                                tries2 += 1
+                        rand_nodes[j] = int(cand)
+
+                    # apply corruption according to bernoulli decision
+                    neg_s[corrupt_head] = rand_nodes[corrupt_head]
+                    neg_o[~corrupt_head] = rand_nodes[~corrupt_head]
+
+                    neg_s_list.append(torch.LongTensor(neg_s).to(self.device))
+                    neg_r_list.append(r_batch)
+                    neg_o_list.append(torch.LongTensor(neg_o).to(self.device))
+
+                # concatenate all negatives, shape: (num_negatives * B,)
+                neg_s_t = torch.cat(neg_s_list)
+                neg_r_t = torch.cat(neg_r_list)
+                neg_o_t = torch.cat(neg_o_list)
 
                 if self.model_name == "CompGCN":
-                    neg_scores = self.model.score(neg_s_t, r_batch, neg_o_t, self.edge_index, self.edge_type)
+                    neg_scores = self.model.score(neg_s_t, neg_r_t, neg_o_t, self.edge_index, self.edge_type)
                 else:
-                    neg_scores = self.model.score(neg_s_t, r_batch, neg_o_t)
+                    neg_scores = self.model.score(neg_s_t, neg_r_t, neg_o_t)
 
-                # margin ranking loss
-                loss_sample = torch.relu(pos_scores + self.margin - neg_scores)
+                # reshape to (num_negatives, B)
+                neg_all = neg_scores.view(num_negatives, -1)  # [neg, B]
+                pos = pos_scores  # [B]
+
+                # For distance-based scores (lower is better), invert scores so higher=harder
+                if getattr(self.model, "higher_better", False):
+                    neg_for_weights = neg_all  # higher => harder already
+                else:
+                    neg_for_weights = -neg_all
+
+                # avoid numerical issues: subtract column-wise max (logsumexp trick)
+                m = neg_for_weights.max(dim=0, keepdim=True)[0]             # [1, B]
+                stable = neg_for_weights - m
+                neg_weights = F.softmax(self.adv_temp * stable, dim=0)      # [neg, B]
+
+                with torch.no_grad():
+                    pos_mean = pos.mean().item()
+                    neg_mean = neg_all.mean().item()
+                    gap = (neg_mean - pos_mean) if not getattr(self.model, "higher_better", False) else (pos_mean - neg_mean)
+                    # entropy of weights (avg over batch)
+                    ent = -(neg_weights * (neg_weights + 1e-12).log()).sum(dim=0).mean().item()
+                print(f"[DBG] epoch {epoch} step {step}: pos_mean={pos_mean:.4f}, neg_mean={neg_mean:.4f}, gap={gap:.4f}, neg_entropy={ent:.4f}")
+
+                # weighted softplus margin loss per negative (smoother than relu)
+                # For distance (lower better): target pos + margin should be < neg -> softplus(pos + margin - neg)
+                if getattr(self.model, "higher_better", False):
+                    loss_terms = F.softplus(neg_all + self.margin - pos.unsqueeze(0))  # [neg, B]
+                else:
+                    loss_terms = F.softplus(pos.unsqueeze(0) + self.margin - neg_all)  # [neg, B]
+
+                # apply weights across negatives, then average across batch, weighted by conf
+                loss_sample = (neg_weights * loss_terms).sum(dim=0)  # [B]
                 loss = (loss_sample * conf_batch).mean()
 
+                # -----------------------------
+                # Backprop + stability: grad clip, optimizer step, immediate normalization
+                # -----------------------------
                 self.optimizer.zero_grad()
                 loss.backward()
+                # clip grads
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=getattr(self, "clip_grad_norm", 5.0))
                 self.optimizer.step()
+
+                # immediate normalization for embeddings for stability
+                if normalize:
+                    with torch.no_grad():
+                        if self.model_name == "RotatE":
+                            try:
+                                # call the model's normalization method (preferred)
+                                self.model.normalize_entities()
+                            except Exception:
+                                # fallback to safe row-wise normalization if the method isn't available / fails
+                                w = self.model.ent.weight.data
+                                denom = w.norm(p=2, dim=1, keepdim=True).clamp(min=1e-6)
+                                self.model.ent.weight.data = w / denom
+
+                            # relations: ensure unit modulus per complex dim (safe attempt)
+                            try:
+                                rel_w = self.model.rel.weight.data
+                                rel_real = rel_w.reshape(-1, self.model.emb_dim, 2)
+                                mag = torch.sqrt((rel_real**2).sum(dim=-1, keepdim=True)).clamp(min=1e-9)
+                                rel_real = rel_real / mag
+                                self.model.rel.weight.data = rel_real.reshape_as(rel_w)
+                            except Exception:
+                                # can't view/reshape relations as expected; skip and rely on epoch normalization
+                                pass
+                        else:
+                            # generic models: normalize entity rows to unit norm
+                            w = self.model.ent.weight.data
+                            denom = w.norm(p=2, dim=1, keepdim=True).clamp(min=1e-6)
+                            self.model.ent.weight.data = w / denom
+
                 epoch_loss += float(loss.item())
 
             # normalize embeddings
@@ -391,42 +575,67 @@ class KGTrainer:
                 print(f"[WARN] wandb.finish failed: {e}")
 
     def evaluate(self, triples: list, k: int = 10):
+        """
+        Filtered evaluation: masks other true objects for the same (s,r) pair.
+        Returns (mrr, hits1, hits10).
+        """
+        all_triples = self.triples if getattr(self, "triples", None) else (self.train_triples + self.val_triples)
+
+        # build (s,r) -> set(o) map
+        true_map = {}
+        for s, r, o, *_ in all_triples:
+            true_map.setdefault((s, r), set()).add(o)
+
         self.model.eval()
         with torch.no_grad():
             ranks = []
-            for s, r, o, conf, src in triples:
+            n_nodes = int(self.model.ent.num_embeddings)
+            higher_better = bool(getattr(self.model, "higher_better", False))
+
+            for s, r, o, *_ in triples:
                 s_t = torch.tensor([s], device=self.device)
                 r_t = torch.tensor([r], device=self.device)
+                all_objs = torch.arange(n_nodes, device=self.device)
 
-                # compute scores for all candidate objects
-                all_objs = torch.arange(self.model.ent.num_embeddings, device=self.device)
+                # compute scores
                 if self.model_name == "CompGCN":
                     scores = self.model.score(
-                        s_t.repeat(len(all_objs)),
-                        r_t.repeat(len(all_objs)),
+                        s_t.repeat(n_nodes),
+                        r_t.repeat(n_nodes),
                         all_objs,
                         self.edge_index,
                         self.edge_type
                     )
                 else:
                     scores = self.model.score(
-                        s_t.repeat(len(all_objs)), 
-                        r_t.repeat(len(all_objs)), 
+                        s_t.repeat(n_nodes),
+                        r_t.repeat(n_nodes),
                         all_objs
                     )
 
-                # auto choose ordering
-                if getattr(self.model, "higher_better", False):
-                    sorted_idx = torch.argsort(scores, descending=True)
-                else:
-                    sorted_idx = torch.argsort(scores, descending=False)
+                # mask other true objects (except the held-out o)
+                scores_masked = scores.clone()
+                for other in true_map.get((s, r), set()):
+                    if other != o:
+                        if higher_better:
+                            scores_masked[other] = -1e9
+                        else:
+                            scores_masked[other] = 1e9
 
-                rank = sorted_idx.tolist().index(o) + 1
+                # rank entities
+                sorted_idx = torch.argsort(scores_masked, descending=higher_better)
+                pos = (sorted_idx == o).nonzero(as_tuple=False)
+
+                if pos.numel() == 0:
+                    rank = n_nodes + 1
+                else:
+                    rank = int(pos[0, 0].item()) + 1
+
                 ranks.append(rank)
 
-            mrr = np.mean([1.0 / r for r in ranks])
-            hits1 = np.mean([1 if r <= 1 else 0 for r in ranks])
-            hits10 = np.mean([1 if r <= 10 else 0 for r in ranks])
+            mrr = float(np.mean([1.0 / r for r in ranks]))
+            hits1 = float(np.mean([1 if r <= 1 else 0 for r in ranks]))
+            hits10 = float(np.mean([1 if r <= 10 else 0 for r in ranks]))
 
         self.model.train()
         return mrr, hits1, hits10
@@ -447,7 +656,21 @@ class KGTrainer:
             np.save(node_out, ent_w)
             np.save(rel_out, rel_w)
             print(f"[KGTrainer] saved CompGCN propagated embeddings -> {node_out}, {rel_out}")
-            return  # skip the rest of save logic
+
+            # save metadata as well (previously skipped)
+            meta = {
+                "model_name": self.model_name,
+                "emb_dim": self.emb_dim,
+                "n_nodes": ent_w.shape[0],
+                "n_rels": rel_w.shape[0],
+                "ent_shape": list(ent_w.shape),
+                "rel_shape": list(rel_w.shape),
+                "higher_better": getattr(self.model, "higher_better", False),
+            }
+            with meta_out.open("w") as f:
+                json.dump(meta, f, indent=2)
+            print(f"[KGTrainer] saved metadata -> {meta_out}")
+            return  # no need to save again
 
         if self.model_name == "RotatE":
             # reshape to (n, emb_dim, 2) -> complex array

@@ -126,6 +126,8 @@ class BaseTrainer:
             joint_dim=self.cfg.model_dim,
             model_name=self.cfg.kg_model,
             model_kwargs=self.cfg.kg_model_kwargs,
+            lr=self.cfg.kg_lr,
+            adv_temp=self.cfg.adv_temp
         )
 
         best_node_path = self.kg_dir / "node_embeddings_best.npy"
@@ -155,7 +157,7 @@ class BaseTrainer:
 
             # train embeddings
             kg_trainer.load_triples()
-            kg_trainer.train(epochs=self.cfg.kg_epochs, log_to_wandb=self.use_wandb)
+            kg_trainer.train(epochs=self.cfg.kg_epochs, log_to_wandb=self.use_wandb, num_negatives=self.cfg.kg_neg_samples, batch_size=64)
             kg_trainer.save_embeddings()
         else:
             print("[BaseTrainer] Using cached KG embeddings")
