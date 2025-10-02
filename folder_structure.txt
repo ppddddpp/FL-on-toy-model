@@ -5,11 +5,11 @@
 │   │   │   ├── base_model.csv
 │   │   │   └── human_body_knowledge_graph.ttl
 │   │   ├── n1
-│   │   │   └── client_1_CirculatorySystem_66_percent.csv
+│   │   │   └── client_1_data.csv
 │   │   ├── n2
-│   │   │   └── client_2_CirculatorySystem_100_percent.csv
+│   │   │   └── client_2_data.csv
 │   │   ├── n3
-│   │   │   └── client_3_ImmuneSystem_50_percent.csv
+│   │   │   └── client_3_data.csv
 │   │   ├── n4
 │   │   │   └── client_4_ImmuneSystem_75_percent.csv
 │   │   ├── n5
