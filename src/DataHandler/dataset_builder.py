@@ -47,13 +47,20 @@ class DatasetBuilder:
         return y, label2id
 
     @staticmethod
-    def build_dataset(path, max_len=32, val_ratio=0.1, test_ratio=0.1):
+    def build_dataset(path, max_len=32, val_ratio=0.1, test_ratio=0.1,
+                        vocab=None, label2id=None):
         # load
         texts, labels = DatasetBuilder.load_csv(path)
-        y, label2id = DatasetBuilder.encode_labels(labels)
 
-        # vocab from texts
-        vocab = DatasetBuilder.build_vocab(texts)
+        # reuse or build label2id
+        if label2id is None:
+            y, label2id = DatasetBuilder.encode_labels(labels)
+        else:
+            y = [label2id[lbl] for lbl in labels]
+
+        # reuse or build vocab
+        if vocab is None:
+            vocab = DatasetBuilder.build_vocab(texts)
 
         # split
         X_train, X_temp, y_train, y_temp = train_test_split(texts, y, test_size=val_ratio+test_ratio, random_state=42)

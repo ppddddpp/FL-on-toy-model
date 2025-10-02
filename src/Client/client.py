@@ -22,36 +22,30 @@ class Client:
         """
         Perform local training starting from global weights.
 
-        Args:
-            global_weights (dict): state_dict from the global model
-            epochs (int): local epochs
-            batch_size (int): mini-batch size
-            lr (float): learning rate
-            save_path (str): if provided, save model checkpoint here
-            log_interval (int): print loss every N batches
-
         Returns:
             dict: updated model weights (state_dict)
             int: number of samples used in training
         """
-        # 1. Initialize model
+        # Initialize model
         model = self.model_fn().to(self.device)
         model.load_state_dict(global_weights)
 
-        # 2. Setup dataloader, optimizer, loss
+        # Setup dataloader, optimizer, loss
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
 
-        # 3. Train locally
+        # Train locally
         model.train()
         for epoch in range(epochs):
-            for batch_idx, (x, y) in enumerate(loader):
-                x, y = x.to(self.device), y.to(self.device)
+            for batch_idx, (ids, mask, y) in enumerate(loader):
+                ids, mask, y = ids.to(self.device), mask.to(self.device), y.to(self.device)
+
                 optimizer.zero_grad()
-                logits = model(x)
+                logits = model(ids, attention_mask=mask)
                 loss = criterion(logits, y)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
                 if (batch_idx + 1) % log_interval == 0:
@@ -59,22 +53,18 @@ class Client:
                           f"Batch {batch_idx+1}/{len(loader)} "
                           f"Loss: {loss.item():.4f}")
 
-        # 4. Optionally save checkpoint
+        # Optionally save checkpoint
         if save_path is not None:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
             print(f"[{self.client_id}] Saved model to {save_path}")
 
-        # 5. Return updated weights + number of samples
-        return model.state_dict(), len(self.dataset)
+        # Return updated weights + number of samples
+        return {k: v.cpu() for k, v in model.state_dict().items()}, len(self.dataset)
 
     def evaluate(self, weights=None, batch_size=16):
         """
         Evaluate accuracy on the client's dataset.
-
-        Args:
-            weights (dict): optional weights to load before eval
-            batch_size (int): dataloader batch size
 
         Returns:
             float: accuracy (0-1)
@@ -87,13 +77,13 @@ class Client:
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
-            for x, y in loader:
-                x, y = x.to(self.device), y.to(self.device)
-                logits = model(x)
+            for ids, mask, y in loader:
+                ids, mask, y = ids.to(self.device), mask.to(self.device), y.to(self.device)
+                logits = model(ids, attention_mask=mask)
                 preds = logits.argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        acc = correct / total if total > 0 else 0
+        acc = correct / total if total > 0 else 0.0
         print(f"[{self.client_id}] Evaluation Accuracy: {acc:.4f}")
-        return acc
+        return float(acc)

@@ -183,10 +183,12 @@ cython_debug/
 # ---Local - project-self ignore---
 
 # Ignore large size folders 
+logs
 data
+backup
 knowledge_graph
 checkpoints
 
 # Ignore additional files and folders
-fine_tuning copy.ipynb
+
 
