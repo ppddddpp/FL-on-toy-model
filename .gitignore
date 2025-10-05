@@ -186,9 +186,10 @@ cython_debug/
 logs
 data
 backup
+eda_results
 knowledge_graph
 checkpoints
 
 # Ignore additional files and folders
 fl_trust_plan.txt
-
+certificate.ipynb

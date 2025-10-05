@@ -15,7 +15,7 @@ from collections import defaultdict
 import torch.nn.functional as F
 import wandb
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 KG_DIR = BASE_DIR / "knowledge_graph"
 KG_DIR.mkdir(parents=True, exist_ok=True)
 

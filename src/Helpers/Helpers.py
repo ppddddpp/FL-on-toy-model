@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 import re
 
 def kg_alignment_loss(joint_emb, batch_ids, kg_embs, node2id, trainer,
@@ -68,3 +69,27 @@ def clean_ttl_file(input_path, output_path):
                 fout.write(line)
 
     return output_path
+
+def log_and_print(*msgs, log_file=None):
+    """
+    Prints and logs the given messages to the specified log file.
+
+    Args:
+        *msgs: The messages to print and log.
+        log_file: The path to the log file. Must be provided.
+
+    Raises:
+        ValueError: If log_file is None.
+    """
+    text = " ".join(str(m) for m in msgs)
+    print(text)
+    
+    if log_file is None:
+        raise ValueError("log_file must be provided")
+    
+    log_file = Path(log_file)
+    if not log_file.parent.exists():
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(text + "\n")

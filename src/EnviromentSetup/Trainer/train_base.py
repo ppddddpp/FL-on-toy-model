@@ -11,12 +11,12 @@ import csv
 import wandb
 from DataHandler import DatasetBuilder
 from Helpers import Config, kg_alignment_loss
-from model.model import ToyBERTClassifier
-from KnowledgeGraphModel.KG_Builder import KGBuilder
-from KnowledgeGraphModel.KG_Trainer import KGTrainer
-from KnowledgeGraphModel.KGVocabAligner import KGVocabAligner
+from EnviromentSetup.model.model import ToyBERTClassifier
+from EnviromentSetup.KnowledgeGraphModel.KG_Builder import KGBuilder
+from EnviromentSetup.KnowledgeGraphModel.KG_Trainer import KGTrainer
+from EnviromentSetup.KnowledgeGraphModel.KGVocabAligner import KGVocabAligner
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 
 class BaseTrainer:
     def __init__(

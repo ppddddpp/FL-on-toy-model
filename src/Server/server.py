@@ -2,7 +2,7 @@ import os
 import torch
 from pathlib import Path
 
-from Trainer.train_base import BaseTrainer
+from EnviromentSetup.Trainer.train_base import BaseTrainer
 from DataHandler.dataset_builder import DatasetBuilder
 from Helpers.configLoader import Config
 

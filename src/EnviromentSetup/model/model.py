@@ -14,7 +14,7 @@ class ToyBERTClassifier(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # 1. Embeddings
+        # Embeddings
         self.token_embeddings = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.position_embeddings = nn.Embedding(max_len, d_model)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))  # [CLS]
@@ -23,7 +23,7 @@ class ToyBERTClassifier(nn.Module):
         self.layernorm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # 2. Transformer Encoder (BERT-style blocks)
+        # Transformer Encoder (BERT-style blocks)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -33,7 +33,7 @@ class ToyBERTClassifier(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 3. Classification head
+        # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Tanh(),          # BERT uses tanh in pooler

@@ -6,7 +6,7 @@ from Server.server import Server
 from Client.client import Client
 from DataHandler.dataset_builder import DatasetBuilder
 from Helpers.configLoader import Config
-from model.model import ToyBERTClassifier
+from EnviromentSetup.model.model import ToyBERTClassifier
 import datetime
 
 BASE_DIR = Path(__file__).resolve().parent.parent

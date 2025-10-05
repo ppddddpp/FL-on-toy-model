@@ -14,7 +14,7 @@ from Helpers.configLoader import Config
 # -------------------------
 # Load config
 # -------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 cfg_path = BASE_DIR / "config" / "config.yaml"
 cfg = Config.load(cfg_path)
 cfg.validate()
