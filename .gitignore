@@ -193,3 +193,5 @@ checkpoints
 # Ignore additional files and folders
 fl_trust_plan.txt
 certificate.ipynb
+test_run.py
+al.txt
