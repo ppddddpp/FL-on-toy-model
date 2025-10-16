@@ -10,6 +10,7 @@ from .anchor_eval import AnchorEvaluator
 from .kg_eval import KGConsistencyEvaluator
 from .signature_eval import SignatureEvaluator
 from .activation_eval import ActivationOutlierDetector
+from .calibration import SafeThresholdCalibrator
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 DL_DIR = BASE_DIR / "deepcheck_ledger"
@@ -260,8 +261,6 @@ class DeepCheckManager:
         except Exception as e:
             print(f"[Ledger] Warning: failed to write ledger for {client_id}: {e}")
 
-
-
         return results
     
     def run_batch(
@@ -343,3 +342,101 @@ class DeepCheckManager:
                 print(f"[DeepCheckManager] Client {cid} failed: {e}")
 
         return results
+
+    def auto_calibrate_thresholds(
+        self,
+        global_model: torch.nn.Module,
+        trusted_deltas: Dict[str, Dict[str, torch.Tensor]],
+        anchor_loader=None,
+        safe_calibrator=None,
+        round_id: Optional[int] = None,
+    ):
+        """
+        Safely recalibrate DeepCheck thresholds using trusted client deltas.
+        Should be called only periodically (e.g., every 10 rounds).
+
+        Parameters
+        ----------
+        global_model : torch.nn.Module
+            Current global model.
+        trusted_deltas : dict
+            Mapping of trusted client_id -> delta (dict of tensors).
+        anchor_loader : optional
+            DataLoader for anchor-based checks.
+        safe_calibrator : SafeThresholdCalibrator
+            A safe calibrator instance. If None, a default one will be created.
+        round_id : int, optional
+            Current round id (for ledger logging).
+
+        Returns
+        -------
+        dict : New thresholds or empty if skipped.
+        """
+
+        if safe_calibrator is None:
+            safe_calibrator = SafeThresholdCalibrator(self)
+
+        print(f"[DeepCheckManager] Auto-calibration triggered — {len(trusted_deltas)} trusted deltas.")
+
+        result = safe_calibrator.calibrate(
+            global_model=global_model,
+            benign_deltas=trusted_deltas,
+            anchor_loader=anchor_loader,
+        )
+
+        if not result:
+            print("[DeepCheckManager] Calibration skipped — insufficient separation or samples.")
+            return {}
+
+        # Log calibration results
+        try:
+            log_entry = {
+                "round_id": round_id or int(time.time()),
+                "timestamp": time.time(),
+                "new_activation_reject_threshold": result["activation_reject_threshold"],
+                "new_anchor_drop_tolerance": result["anchor_drop_tolerance"],
+                "sep": result.get("sep", None),
+            }
+            ledger_file = DL_DIR / "threshold_calibration_log.json"
+            existing = []
+            if ledger_file.exists():
+                with open(ledger_file, "r") as f:
+                    existing = json.load(f)
+            existing.append(log_entry)
+            with open(ledger_file, "w") as f:
+                json.dump(existing, f, indent=2)
+            print(f"[DeepCheckManager] Logged calibration event (round={round_id}).")
+        except Exception as e:
+            print(f"[DeepCheckManager] Failed to log calibration: {e}")
+
+        return result
+
+    def run_deep_checks(self, *, global_model, client_delta, client_sig=None,
+                    ref_sig=None, anchor_loader=None, client_id=None, round_id=None) -> Dict[str,Any]:
+        """
+        Canonical single-entry call for per-update deterministic scoring.
+        Returns dict with standardized fields.
+        """
+        res = self.compute(
+            global_model=global_model,
+            client_delta=client_delta,
+            client_sig=client_sig,
+            ref_sig=ref_sig,
+            anchor_loader=anchor_loader,
+            client_id=client_id,
+        )
+        # normalize keys / fill defaults
+        out = {
+            "client_id": client_id,
+            "round_id": round_id or res.get("round_id") or int(time.time()),
+            "S_anchor": float(res.get("S_anchor") or 1.0),
+            "S_KG": None if res.get("S_KG") is None else float(res.get("S_KG")),
+            "S_sig": None if res.get("S_sig") is None else float(res.get("S_sig")),
+            "S_activation": None if res.get("S_activation") is None else float(res.get("S_activation")),
+            "S_deep": float(res.get("S_deep", 1.0)),
+            "S_final": float(res.get("S_final", 1.0)),
+            "L_check": float(res.get("L_check", 0.0)),
+            "flags": {k:v for k,v in res.items() if k.endswith("_flag")}
+        }
+        out.update(res)
+        return out

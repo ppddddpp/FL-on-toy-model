@@ -24,6 +24,8 @@ from .s5_deep_check.kg_eval import KGConsistencyEvaluator
 from .s5_deep_check.signature_eval import SignatureEvaluator
 from .s5_deep_check.activation_eval import ActivationOutlierDetector
 
+from .SelfCheck import SelfCheckManager
+
 from .base import (
     run_selfcheck_scenario_1, 
     run_selfcheck_scenario_2, 
@@ -68,4 +70,6 @@ __all__ = [
     "run_selfcheck_scenario_5",
     "run_selfcheck_scenario_6",
     "run_selfcheck_scenario_7",
+
+    "SelfCheckManager",
 ]

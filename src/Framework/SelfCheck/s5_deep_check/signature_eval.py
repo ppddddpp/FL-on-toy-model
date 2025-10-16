@@ -61,7 +61,13 @@ class SignatureEvaluator:
         self.round_id = 0
         self.salt_strength = salt_strength
 
-    # --------------------------- helpers ---------------------------
+    def set_fixed_seed(self, seed: int):
+        """Force a fixed seed for deterministic auditing."""
+        self.round_seed = seed
+        self.seed_rotation = False
+        self._rotate_seed()
+        print(f"[SignatureEval] Fixed seed mode enabled (seed={seed})")
+
     def _rotate_seed(self):
         """Rotate the internal seed per round for projection stability."""
         if self.seed_rotation:

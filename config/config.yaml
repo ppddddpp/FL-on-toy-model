@@ -32,5 +32,8 @@ kg_opn: "corr"              # options: corr | sub | mult
 cls_weight: 2.0
 kg_weight: 0.3
 
+# Calibration / trust tuning parameters
+calib_interval: 10          # number of epochs between calibrations
+
 # Wandb parameters
 project_name: "fl-toy-experiments"

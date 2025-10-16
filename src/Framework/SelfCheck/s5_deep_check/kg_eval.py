@@ -18,6 +18,8 @@ class KGConsistencyEvaluator:
         label_map: Dict[int, str],
         device: Optional[torch.device] = None,
         symmetric: bool = True,
+        reject_threshold=0.4, 
+        ema_decay=0.9
     ):
         """
         Initializes the KGConsistencyEvaluator.
@@ -33,10 +35,18 @@ class KGConsistencyEvaluator:
             Device for inference (defaults to model's device).
         symmetric : bool
             If True, treat (a,b) and (b,a) as equivalent relations.
+        reject_threshold : float
+            Reject threshold for semantic consistency check
+        ema_decay : float
+            Exponential moving average decay
         """
         self.device = device
         self.label_map = dict(label_map)
         self.symmetric = bool(symmetric)
+        self.reject_threshold = reject_threshold
+        self.ema_decay = ema_decay
+        self.ema_skg = None
+        self._rolling_scores = []
         # normalize edges for symmetry
         if symmetric:
             edges_sym = set()
@@ -68,6 +78,17 @@ class KGConsistencyEvaluator:
             preds.extend(p.cpu().tolist())
             trues.extend(y.cpu().tolist())
         return preds, trues
+
+    def _update_reference(self, val):
+        self._rolling_scores.append(val)
+        if len(self._rolling_scores) > 256:
+            self._rolling_scores.pop(0)
+
+    def _normalize_score(self, val):
+        if not self._rolling_scores:
+            return val
+        ref = np.percentile(self._rolling_scores, 50)
+        return np.clip(val / (ref + 1e-8), 0, 1)
 
     def _compute_consistency(self, preds, trues) -> float:
         """Compute semantic consistency rate S_KG."""
@@ -130,9 +151,29 @@ class KGConsistencyEvaluator:
         model_clone.load_state_dict(sd, strict=False)
 
         preds, trues = self._predict_labels(model_clone, anchor_loader, device)
-        S_KG = self._compute_consistency(preds, trues)
+        S_KG_raw = self._compute_consistency(preds, trues)
+        self._update_reference(S_KG_raw)
+        S_KG = self._normalize_score(S_KG_raw)
         L_KG = 1.0 - S_KG
-        return {"S_KG": float(S_KG), "L_KG": float(L_KG)}
+
+        if self.ema_skg is None:
+            self.ema_skg = S_KG
+        else:
+            self.ema_skg = self.ema_decay * self.ema_skg + (1 - self.ema_decay) * S_KG
+
+        drift_ratio = abs(S_KG - self.ema_skg) / (self.ema_skg + 1e-8)
+
+        flag = "reject" if S_KG < self.reject_threshold else "pass"
+        print(f"[KGCheck] Client {client_id}: S_KG={S_KG:.3f}, drift={drift_ratio:.3f}, flag={flag}")
+
+        S_KG_adj = max(0.0, S_KG * np.exp(-3 * drift_ratio))
+
+        return {
+            "S_KG": float(S_KG_adj),
+            "L_KG": float(1.0 - S_KG),
+            "drift_ratio": float(drift_ratio),
+            "KG_flag": flag
+        }
 
     def compute_batch(self, skg_list: Sequence[float]) -> Dict[str, Any]:
         """Batch version: normalize a list of precomputed S_KG values."""

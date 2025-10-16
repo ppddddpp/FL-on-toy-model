@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from scipy.stats import zscore
 import copy
+import os
 import time
 import hashlib
 
@@ -158,7 +159,6 @@ class ActivationOutlierDetector:
         else:
             drift_ema = 0.0
 
-
         # --- PCA variance ratio (proxy for complexity drift) ---
         try:
             pca = PCA(n_components=min(self.n_components, acts.shape[1]))
@@ -198,3 +198,61 @@ class ActivationOutlierDetector:
             "activation_flag": activation_flag,
             "round_id": int(time.time())
         }
+
+    @staticmethod
+    def build_baseline(global_model, anchor_loader, layer_name="features",
+                       max_samples=512, save_path="baseline_activation_stats.npz"):
+        """
+        Compute and save baseline activation statistics from trusted (clean) data.
+        """
+        model = copy.deepcopy(global_model)
+        model.eval()
+
+        activations = []
+        handle = None
+
+        def hook_fn(_, __, output):
+            if isinstance(output, torch.Tensor):
+                activations.append(output.detach().cpu().flatten(1))
+
+        # Register hook
+        for n, m in model.named_modules():
+            if layer_name in n:
+                handle = m.register_forward_hook(hook_fn)
+                break
+
+        if handle is None:
+            raise ValueError(f"No layer containing '{layer_name}' found in model.")
+
+        model_device = next(model.parameters()).device
+        sample_count = 0
+        with torch.no_grad():
+            for x, _ in anchor_loader:
+                x = x.to(model_device)
+                model(x)
+                sample_count += x.size(0)
+                if sample_count >= max_samples:
+                    break
+
+        handle.remove()
+        acts = torch.cat(activations, dim=0).numpy()
+        np.savez(save_path,
+                    mean=np.mean(acts, axis=0),
+                    std=np.std(acts, axis=0),
+                    cov=np.cov(acts, rowvar=False))
+        print(f"[ActivationOutlierDetector] Baseline saved to {save_path}")
+
+    def load_baseline(self, path="baseline_activation_stats.npz"):
+        """
+        Load precomputed baseline mean/std into EMA state.
+        """
+        if not os.path.exists(path):
+            print(f"[ActivationOutlierDetector] Baseline file not found: {path}")
+            return False
+
+        data = np.load(path)
+        self._ema_mean = float(np.mean(data["mean"]))
+        self._ema_std = float(np.mean(data["std"]))
+        self._ema_zmax = 1.0  # reasonable neutral initialization
+        print(f"[ActivationOutlierDetector] Loaded baseline stats from {path}")
+        return True

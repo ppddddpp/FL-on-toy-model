@@ -39,6 +39,9 @@ class Config:
     cls_weight: float = 3.0
     kg_weight: float = 0.1
 
+    # Calibration / trust tuning parameters
+    calib_interval: 10 
+
     # Wandb parameters
     project_name: str = "fl-toy-experiments"
 
