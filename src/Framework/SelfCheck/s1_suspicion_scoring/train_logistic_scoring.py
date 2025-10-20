@@ -2,7 +2,7 @@
 import os
 import numpy as np
 import torch
-from logistic_model import LogisticScoring
+from .logistic_model import LogisticScoring
 from typing import Optional
 from pathlib import Path
 

@@ -189,9 +189,13 @@ backup
 eda_results
 knowledge_graph
 checkpoints
+scheduler_log
+ema_memory
+deepcheck_ledger
 
 # Ignore additional files and folders
 fl_trust_plan.txt
 certificate.ipynb
 test_run.py
 al.txt
+nb_phrase.txt

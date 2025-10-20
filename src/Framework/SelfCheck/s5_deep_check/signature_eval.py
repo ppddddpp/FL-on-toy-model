@@ -115,7 +115,31 @@ class SignatureEvaluator:
             return 1.0
         return max(1e-6, float(np.percentile(self._rolling_L, self.lmax_percentile)))
 
-    # --------------------------- main ---------------------------
+    def make_signature_from_delta(self, delta: dict, dim: int = 256, device="cpu") -> torch.Tensor:
+        parts = []
+        for k in sorted(delta.keys()):
+            v = delta[k]
+            if isinstance(v, torch.Tensor):
+                parts.append(v.detach().cpu().flatten())
+            else:
+                parts.append(torch.as_tensor(v).cpu().flatten())
+        if len(parts) == 0:
+            return torch.zeros(dim, dtype=torch.float32, device=device)
+        flat = torch.cat(parts).numpy().astype(np.float32)
+        h = hashlib.sha256(flat.tobytes()).digest()
+        seed = int.from_bytes(h[:4], "little")
+        rng = np.random.default_rng(seed)
+        proj = rng.standard_normal((flat.shape[0], dim)).astype(np.float32)
+        sig = flat @ proj
+        sig = sig / (np.linalg.norm(sig) + 1e-12)
+        return torch.from_numpy(sig).to(device)
+
+    def encode(self, delta: dict, dim: int = 256, device: str = "cpu") -> torch.Tensor:
+        """
+        Unified API: produce a signature from a delta dict.
+        Keeps callers independent of implementation details (deterministic vs learned).
+        """
+        return self.make_signature_from_delta(delta, dim=dim, device=device)
 
     def compute(
         self,
@@ -158,8 +182,8 @@ class SignatureEvaluator:
 
         self._update_Lmax(L_sig)
         L_max = self._compute_Lmax()
-        S_sig = 1.0 - min(L_sig / (L_max + self.eps), 1.0)
-
+        S_sig = 1.0 - min(max(L_sig / (L_max + self.eps), 0.0), 1.0)
+        
         # Log reproducible signature hash (for ledger or audit)
         hash_input = (client_sig + reference_sig).detach().cpu().numpy().tobytes()
         sig_hash = hashlib.sha256(hash_input).hexdigest()[:16]

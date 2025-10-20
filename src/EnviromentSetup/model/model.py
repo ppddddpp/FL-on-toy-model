@@ -19,11 +19,10 @@ class ToyBERTClassifier(nn.Module):
         self.position_embeddings = nn.Embedding(max_len, d_model)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))  # [CLS]
 
-        # (optional: segment embeddings if needed)
         self.layernorm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Transformer Encoder (BERT-style blocks)
+        # Transformer Encoder (BERT-style)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -36,7 +35,7 @@ class ToyBERTClassifier(nn.Module):
         # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
-            nn.Tanh(),          # BERT uses tanh in pooler
+            nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(d_model, num_classes)
         )
@@ -46,32 +45,53 @@ class ToyBERTClassifier(nn.Module):
         x: (B, T) token IDs
         attention_mask: (B, T) with 1 for real tokens, 0 for padding
         return_hidden: if True, also return the CLS embedding
-        returns: 
-            logits (B, num_classes)
-            cls_vec (B, D) if return_hidden=True
         """
+        if torch.cuda.is_available():
+            model_device = torch.device("cuda")
+            self.to(model_device)
+        else:
+            model_device = torch.device("cpu")
+            
+        if x.device != model_device:
+            x = x.to(model_device)
+        if attention_mask is not None and attention_mask.device != model_device:
+            attention_mask = attention_mask.to(model_device)
+
+        # --- Input normalization ---
+        if x.dim() == 1:
+            x = x.unsqueeze(0)  # allow single example input
+
+        device = x.device  # single source of truth
+
+        if attention_mask is None:
+            # Auto-generate from padding tokens (0 = pad)
+            attention_mask = (x != 0).long().to(device)
+        elif attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0).to(device)
+        else:
+            attention_mask = attention_mask.to(device)
+
         B, T = x.size()
-        pos_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
-        tok_emb = self.token_embeddings(x)  # (B, T, D)
+
+        # --- Embedding + positional encoding ---
+        pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        tok_emb = self.token_embeddings(x)
         pos_emb = self.position_embeddings(pos_ids)
         emb = tok_emb + pos_emb
 
-        # prepend CLS
-        cls = self.cls_token.expand(B, -1, -1)
+        # prepend [CLS]
+        cls = self.cls_token.expand(B, -1, -1).to(device)
         emb = torch.cat([cls, emb], dim=1)
 
         emb = self.layernorm(emb)
         emb = self.dropout(emb)
 
-        # --- handle attention mask ---
-        if attention_mask is not None:
-            cls_mask = torch.ones((B, 1), device=x.device, dtype=attention_mask.dtype)
-            attn_mask = torch.cat([cls_mask, attention_mask], dim=1)  # (B, T+1)
-            key_padding_mask = (attn_mask == 0)  # (B, T+1)
-        else:
-            key_padding_mask = None
+        # --- build attention mask ---
+        cls_mask = torch.ones((B, 1), device=device, dtype=attention_mask.dtype)
+        attn_mask = torch.cat([cls_mask, attention_mask], dim=1)  # (B, T+1)
+        key_padding_mask = (attn_mask == 0)
 
-        # transformer encoder
+        # --- transformer encoder ---
         out = self.encoder(emb, src_key_padding_mask=key_padding_mask)
 
         # CLS vector
@@ -83,4 +103,3 @@ class ToyBERTClassifier(nn.Module):
         if return_hidden:
             return logits, cls_vec
         return logits
-

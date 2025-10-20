@@ -107,7 +107,17 @@ class SubsetAggregationDetector:
     def _aggregate_subset(self, subset, deltas, weights):
         vecs = [deltas[cid].reshape(-1) for cid in subset]
         if weights is None:
-            agg = np.mean(vecs, axis=0)
+            max_len = max(v.shape[0] for v in vecs)
+            norm_vecs = []
+            for v in vecs:
+                if v.shape[0] < max_len:
+                    pad = np.zeros(max_len - v.shape[0], dtype=v.dtype)
+                    v = np.concatenate([v, pad])
+                elif v.shape[0] > max_len:
+                    v = v[:max_len]
+                norm_vecs.append(v)
+
+            agg = np.mean(np.stack(norm_vecs, axis=0), axis=0)
         else:
             ws = np.array([weights.get(cid, 1.0) for cid in subset])
             ws = ws / np.sum(ws)

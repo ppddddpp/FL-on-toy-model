@@ -10,14 +10,43 @@ def _normalize(vec: torch.Tensor) -> torch.Tensor:
     return vec / norm
 
 
-def _mean_direction(vectors: Sequence[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Compute mean direction of a list of tensors."""
-    if not vectors:
-        return None
-    stacked = torch.stack(vectors, dim=0)
-    mean_vec = stacked.mean(dim=0)
-    return _normalize(mean_vec)
+def _mean_direction(vectors, global_expected_len=None):
+    if len(vectors) == 0:
+        raise ValueError("No vectors provided to _mean_direction")
 
+    lengths = [v.numel() for v in vectors]
+    unique_lengths = set(lengths)
+
+    # If all same length -> proceed as before
+    if len(unique_lengths) == 1:
+        stacked = torch.stack([v.flatten() for v in vectors], dim=0)
+        ref = stacked.mean(dim=0)
+        return ref / (ref.norm(p=2) + 1e-8), None  # None => no shape flags
+
+    # If multiple lengths:
+    # Prefer to use vectors that match the global_expected_len, otherwise majority group
+    if global_expected_len is not None and global_expected_len in unique_lengths:
+        use_len = global_expected_len
+    else:
+        # choose majority length
+        from collections import Counter
+        cnt = Counter(lengths)
+        use_len = cnt.most_common(1)[0][0]
+
+    chosen = []
+    flags = {}
+    for i, v in enumerate(vectors):
+        if v.numel() == use_len:
+            chosen.append(v.flatten())
+            flags[i] = False
+        else:
+            flags[i] = True  # mismatched shape
+
+    stacked = torch.stack(chosen, dim=0)
+    ref = stacked.mean(dim=0)
+    if ref.norm() < 1e-8:
+        ref = torch.zeros_like(chosen[0])
+    return ref / (ref.norm(p=2) + 1e-8), flags
 
 def _median_direction(vectors: Sequence[torch.Tensor]) -> Optional[torch.Tensor]:
     """
@@ -111,19 +140,32 @@ class CosineCheck:
         if not deltas:
             return {"reference": None, "s_cos": np.array([], dtype=float)}
 
+        # --- Normalize all delta lengths to match ---
+        max_len = max(v.numel() for v in deltas)
+        normalized = []
+        for i, v in enumerate(deltas):
+            v = v.flatten()
+            if v.numel() < max_len:
+                pad = torch.zeros(max_len - v.numel(), device=v.device, dtype=v.dtype)
+                v = torch.cat([v, pad])
+            elif v.numel() > max_len:
+                v = v[:max_len]
+            normalized.append(v)
+
+        # --- Compute reference ---
         ref = precomputed_ref
         if ref is None:
             if self.direction_agg == "median":
-                ref = _median_direction(deltas)
+                ref = _median_direction(normalized)
             else:
-                ref = _mean_direction(deltas)
+                ref, _ = _mean_direction(normalized)
 
         if ref is None:
-            return {"reference": None, "s_cos": np.zeros(len(deltas), dtype=float)}
+            return {"reference": None, "s_cos": np.zeros(len(normalized), dtype=float)}
 
         ref_norm = torch.norm(ref).item() + self.eps
         s_list = []
-        for delta_i in deltas:
+        for delta_i in normalized:
             if delta_i is None or delta_i.numel() == 0:
                 s_list.append(0.0)
                 continue
@@ -133,7 +175,8 @@ class CosineCheck:
             s_cos = 1.0 - (cos_i + 1.0) / 2.0
             s_list.append(float(np.clip(s_cos, 0.0, 1.0)))
 
-        return {"reference": ref, "s_cos": np.array(s_list, dtype=float)}
+        mean_alignment = float(1 - np.mean(s_list))
+        return {"reference": ref, "s_cos": np.array(s_list, dtype=float), "mean_cos": mean_alignment}
 
 # for testing
 if __name__ == "__main__":

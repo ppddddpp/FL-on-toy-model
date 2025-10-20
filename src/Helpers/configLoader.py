@@ -40,7 +40,11 @@ class Config:
     kg_weight: float = 0.1
 
     # Calibration / trust tuning parameters
-    calib_interval: 10 
+    calib_interval: int = 10 
+
+    # FL parameters
+    allow_dynamic_label_expansion: bool = False
+    share_label_space: bool = False
 
     # Wandb parameters
     project_name: str = "fl-toy-experiments"

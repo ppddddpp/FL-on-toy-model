@@ -45,7 +45,9 @@ class BaseTrainer:
             dataset_path = BASE_DIR / "data" / "medical_data" / "base" / "base_model.csv"
             train_dataset, val_dataset, test_dataset, vocab, label2id = DatasetBuilder.build_dataset(
                 path=dataset_path,
-                max_len=cfg.max_seq_len
+                max_len=cfg.max_seq_len,
+                text_col="Information",
+                label_col="Group"
             )
 
             vocab_size = len(vocab)

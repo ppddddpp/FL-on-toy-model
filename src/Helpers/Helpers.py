@@ -49,7 +49,7 @@ def clean_ttl_file(input_path, output_path):
     keep_pattern = re.compile(r'(@prefix|<.*>|:|#)')
 
     with open(input_path, "r", encoding="utf-8") as fin, \
-         open(output_path, "w", encoding="utf-8") as fout:
+        open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             stripped = line.strip()
 

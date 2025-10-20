@@ -464,7 +464,8 @@ class KGTrainer:
                     gap = (neg_mean - pos_mean) if not getattr(self.model, "higher_better", False) else (pos_mean - neg_mean)
                     # entropy of weights (avg over batch)
                     ent = -(neg_weights * (neg_weights + 1e-12).log()).sum(dim=0).mean().item()
-                print(f"[DBG] epoch {epoch} step {step}: pos_mean={pos_mean:.4f}, neg_mean={neg_mean:.4f}, gap={gap:.4f}, neg_entropy={ent:.4f}")
+                
+                #print(f"[DBG] epoch {epoch} step {step}: pos_mean={pos_mean:.4f}, neg_mean={neg_mean:.4f}, gap={gap:.4f}, neg_entropy={ent:.4f}")
 
                 # weighted softplus margin loss per negative (smoother than relu)
                 # For distance (lower better): target pos + margin should be < neg -> softplus(pos + margin - neg)

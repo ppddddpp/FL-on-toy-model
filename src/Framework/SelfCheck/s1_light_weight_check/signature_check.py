@@ -48,16 +48,23 @@ class SignatureCheck:
             self._proj_dim_in = dim_in
         return self._projection_matrix_cache
 
-    def compute_signature(self, delta: torch.Tensor) -> Optional[np.ndarray]:
+    def compute_signature(self, delta: torch.Tensor, dim_in: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Compute compressed signature for a given flattened delta tensor.
-        Returns None if delta is empty. Otherwise, returns sigma_i belonging to R^{sig_dim}.
+        Optionally uses a fixed input dimension (dim_in) for consistency across clients.
         """
         if delta is None or delta.numel() == 0:
             return None
         v = delta.detach().cpu().numpy().astype(np.float32)
-        W = self._get_projection_matrix(v.shape[0])
-        sig = np.dot(W, v)  # shape (sig_dim,)
+        # use provided dim_in for consistent projection, fallback to v.shape[0]
+        W = self._get_projection_matrix(dim_in or v.shape[0])
+        # truncate or pad v to dim_in
+        if dim_in is not None:
+            if v.shape[0] < dim_in:
+                v = np.concatenate([v, np.zeros(dim_in - v.shape[0], dtype=np.float32)])
+            elif v.shape[0] > dim_in:
+                v = v[:dim_in]
+        sig = np.dot(W, v)
         return sig
 
     def compute(
@@ -105,27 +112,33 @@ class SignatureCheck:
         s_sig = float(np.clip(s_sig, 0.0, 1.0))
         return s_sig
 
-    def compute_batch(
-        self, signatures: Sequence[np.ndarray]
-    ) -> Dict[str, Any]:
+    def compute_batch(self, signatures: Sequence[Optional[np.ndarray]]) -> Dict[str, Any]:
         """
         Compute median signature and all s_sig scores for a batch.
-
-        Returns dict:
-            {
-                "median_sig": np.ndarray,
-                "median_dist": float,
-                "s_sig": np.ndarray  # shape (N,)
-            }
+        Handles variable-length signatures by padding/truncating before stacking.
         """
-        if not signatures:
+        # Remove any None entries
+        valid_sigs = [s for s in signatures if s is not None]
+        if not valid_sigs:
             return {
                 "median_sig": None,
                 "median_dist": self.eps,
                 "s_sig": np.array([], dtype=float)
             }
 
-        sigs = np.stack(signatures, axis=0)
+        # --- Normalize signature shapes ---
+        max_len = max(s.shape[0] for s in valid_sigs)
+        normed = []
+        for i, s in enumerate(valid_sigs):
+            if s.shape[0] < max_len:
+                pad = np.zeros(max_len - s.shape[0], dtype=np.float32)
+                s = np.concatenate([s, pad])
+            elif s.shape[0] > max_len:
+                s = s[:max_len]
+            normed.append(s)
+
+        # --- Compute median + scores ---
+        sigs = np.stack(normed, axis=0)
         med_sig = np.median(sigs, axis=0)
         dists = np.linalg.norm(sigs - med_sig[None, :], axis=1)
         med_d = max(float(np.median(dists)), self.eps)
@@ -134,6 +147,10 @@ class SignatureCheck:
 
         return {"median_sig": med_sig, "median_dist": med_d, "s_sig": s}
 
+    def compute_from_deltas(self, deltas: Sequence[torch.Tensor]) -> Dict[str, Any]:
+        max_len = max(d.numel() for d in deltas)
+        sigs = [self.compute_signature(d, dim_in=max_len) for d in deltas]
+        return self.compute_batch(sigs)
 
 # For testing
 if __name__ == "__main__":

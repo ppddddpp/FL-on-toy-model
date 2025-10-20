@@ -80,12 +80,17 @@ class ChallengeCheck:
         arr = np.asarray(accs, dtype=float)
         if self.use_median_ref:
             ref = float(np.median(arr))
+            if baseline_acc is not None:
+                ref = 0.5 * (ref + float(baseline_acc))  # smooth reference
         elif baseline_acc is not None:
             ref = float(baseline_acc)
         else:
-            ref = float(np.median(arr))  # fallback to median
+            ref = float(np.median(arr))
 
-        deltas = np.maximum(0.0, ref - arr)
+        if np.all(arr < 0.2):  # e.g. all bad
+            ref = max(ref, getattr(self, "baseline_acc", 0.5))
+
+        deltas = np.maximum(0.0, np.abs(arr - ref))
         s = deltas / (self.A_max + self.eps)
         s = np.clip(s, 0.0, 1.0)
 

@@ -21,7 +21,7 @@ class NormCheck:
     Norm-based deviation detector.
     """
 
-    def __init__(self, z_max: float = 3.0, eps: float = 1e-8):
+    def __init__(self, z_max: float = 2.0, eps: float = 1e-8):
         """
         Initialize NormCheck with configurable parameters.
 

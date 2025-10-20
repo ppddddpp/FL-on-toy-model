@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from tqdm import tqdm
-from deep_check_eval import DeepCheckManager
+from typing import Any
 
 class ThresholdCalibrator:
     """
@@ -14,6 +14,7 @@ class ThresholdCalibrator:
         deepcheck: DeepCheckManager instance
         target_fpr: target false-positive rate for benign clients
         """
+        from ..deep_check_eval import DeepCheckManager
         self.deepcheck = deepcheck or DeepCheckManager()
         self.target_fpr = target_fpr
 
@@ -71,8 +72,10 @@ class SafeThresholdCalibrator(ThresholdCalibrator):
     against calibration poisoning or manipulation.
     """
 
-    def __init__(self, deepcheck: DeepCheckManager, target_fpr=0.05,
+    def __init__(self, deepcheck: Any, target_fpr=0.05,
                     min_samples=20, max_delta=0.05, ema_alpha=0.1):
+        from ..deep_check_eval import DeepCheckManager
+        deepcheck = deepcheck or DeepCheckManager()
         super().__init__(deepcheck, target_fpr)
         self.min_samples = min_samples
         self.max_delta = max_delta

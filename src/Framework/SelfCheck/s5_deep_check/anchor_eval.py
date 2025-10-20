@@ -78,9 +78,15 @@ class AnchorEvaluator:
         model = model.eval().to(device)
         correct, total = 0, 0
         for batch in dataloader:
-            x, y = batch
-            x = x.to(device)
-            y = y.to(device)
+            if len(batch) == 3:
+                x, mask, y = batch
+            elif len(batch) == 2:
+                x, y = batch
+                mask = None
+            else:
+                raise ValueError(f"Unexpected batch format with {len(batch)} elements.")
+            
+            x, y = x.to(next(model.parameters()).device), y.to(next(model.parameters()).device)
             logits = model(x)
             if logits.ndim == 1 or (logits.ndim == 2 and logits.shape[1] == 1):
                 preds = (torch.sigmoid(logits.view(-1)) > 0.5).long()
@@ -105,15 +111,46 @@ class AnchorEvaluator:
     def _safe_apply_delta(self, state_dict, client_delta, device):
         """Apply additive delta but only for matching keys/shapes. Returns warnings list."""
         warnings = []
-        for k, v in client_delta.items():
+
+        # --- Normalize input robustly ---
+        if isinstance(client_delta, dict):
+            items_iter = list(client_delta.items())
+        elif hasattr(client_delta, "items"):  # handle OrderedDict-like
+            try:
+                items_iter = list(client_delta.items())
+            except Exception:
+                items_iter = []
+                warnings.append("invalid_delta_items")
+        elif isinstance(client_delta, (list, tuple)):
+            # only keep valid 2-element pairs
+            items_iter = [p for p in client_delta if isinstance(p, (tuple, list)) and len(p) == 2]
+            if not items_iter:
+                warnings.append("invalid_list_format")
+        else:
+            warnings.append(f"unsupported_delta_type:{type(client_delta)}")
+            items_iter = []
+
+        # --- Safe iteration ---
+        for entry in items_iter:
+            try:
+                k, v = entry
+            except Exception:
+                warnings.append(f"invalid_pair:{entry}")
+                continue
+
             if k not in state_dict:
                 warnings.append(f"missing_key:{k}")
+                continue
+            if not isinstance(v, torch.Tensor):
+                warnings.append(f"non_tensor_value:{k}")
                 continue
             if state_dict[k].shape != v.shape:
                 warnings.append(f"shape_mismatch:{k}:{state_dict[k].shape}!={v.shape}")
                 continue
-            # do arithmetic on device to avoid extra moves; we'll place back in state_dict as CPU for load_state_dict
-            state_dict[k] = (state_dict[k].to(device) + v.to(device))
+
+            # Apply delta safely
+            state_dict[k] = state_dict[k].to(device) + v.to(device)
+
         return warnings
 
     def _bn_calibration(self, model_clone, device):
@@ -165,6 +202,14 @@ class AnchorEvaluator:
         except StopIteration:
             dev = torch.device("cpu")
 
+        if not isinstance(client_delta, dict):
+            self.logger.warning(f"[AnchorSandbox] client_delta type={type(client_delta)} — attempting coercion")
+            try:
+                client_delta = dict(client_delta)
+            except Exception:
+                self.logger.warning(f"[AnchorSandbox] failed to coerce delta for client={client_id}")
+                return None
+
         # apply delta safely using same helper as compute()
         sd = model_clone.state_dict()
         warnings = self._safe_apply_delta(sd, client_delta, dev)
@@ -197,9 +242,20 @@ class AnchorEvaluator:
         criterion = torch.nn.CrossEntropyLoss()
 
         with torch.no_grad():
-            for x, y in self.anchor_loader:
+            for batch in self.anchor_loader:
+                if len(batch) == 3:
+                    x, mask, y = batch
+                elif len(batch) == 2:
+                    x, y = batch
+                    mask = None
+                else:
+                    raise ValueError(f"Unexpected batch format with {len(batch)} elements.")
+                
                 x, y = x.to(next(model.parameters()).device), y.to(next(model.parameters()).device)
-                out = model(x)
+                if mask is not None:
+                    out = model(x, attention_mask=mask)
+                else:
+                    out = model(x)
                 loss = criterion(out, y)
                 total_loss += loss.item() * len(x)
                 preds = out.argmax(dim=1)
