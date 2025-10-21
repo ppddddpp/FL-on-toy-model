@@ -15,6 +15,7 @@ from .adaptive_threshold import AdaptiveThreshold
 from .smoothing import SuspicionSmoothing
 from .logistic_model import LogisticScoring
 from .temporal_memory import TemporalMemory
+from Helpers.Helpers import log_and_print
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 EMA_DIR = BASE_DIR / "ema_memory"
@@ -33,7 +34,8 @@ class TriageManager:
         base_threshold: float = 0.1,
         use_adaptive: bool = True,
         ema_dir: Optional[str] = None,
-        alpha_ema: float = 0.2
+        alpha_ema: float = 0.2,
+        log_dir: Path = BASE_DIR / "logs" / "run.txt",
     ):
         """
         Initializes a TriageManager instance.
@@ -60,12 +62,13 @@ class TriageManager:
         The EMA memory file is stored as a JSON file in the specified directory. If the file does not exist, it will be created. If the file exists, the TriageManager will try to load the existing EMA state.
         """
         # Component injection with fallback defaults
-        self.scorer = scorer if scorer is not None else LogisticScoring()
+        self.scorer = scorer if scorer is not None else RuleBasedScoring() 
         self.adaptive = adaptive if adaptive is not None else AdaptiveThreshold()
         self.smoother = smoother if smoother is not None else SuspicionSmoothing()
 
         self.use_adaptive = use_adaptive
         self.base_threshold = float(base_threshold)
+        self.log_dir = log_dir
 
         # ---- EMA memory setup ----
         self.alpha_ema = alpha_ema
@@ -78,15 +81,16 @@ class TriageManager:
             try:
                 with open(self.ema_file, "r") as f:
                     self.client_ema = json.load(f)
-                print(f"[TriageManager] Loaded previous EMA state from {self.ema_file}")
+                log_and_print(f"[TriageManager] Loaded previous EMA state from {self.ema_file}", log_file=self.log_dir)
             except Exception as e:
-                print(f"[TriageManager] Warning: failed to load EMA memory: {e}")
+                log_and_print(f"[TriageManager] Warning: failed to load EMA memory: {e}", log_file=self.log_dir)
 
-        print(
+        log_and_print(
             f"[TriageManager] Initialized | "
             f"Scorer={self.scorer.__class__.__name__}, "
             f"Adaptive={'ON' if self.use_adaptive else 'OFF'}, "
-            f"BaseThreshold={self.base_threshold:.3f}"
+            f"BaseThreshold={self.base_threshold:.3f}",
+            log_file=self.log_dir
         )
 
     def step(
@@ -139,7 +143,7 @@ class TriageManager:
             feats.update({f"ema_{k}": v for k, v in ema_updated.items()})
 
             if round_id is not None:
-                print(f"[TemporalMemory] Round {round_id:03d} | {cid:<10s} | {ema_updated}")
+                log_and_print(f"[TemporalMemory] Round {round_id:03d} | {cid:<10s} | {ema_updated}", log_file=self.log_dir)
 
         # Save updated EMA state
         self.temporal_memory.save()
@@ -181,7 +185,7 @@ class TriageManager:
         }
 
         if round_id is not None:
-            print(f"[TriageManager] Round {round_id} processed — Adaptive T={T_flag:.3f}")
+            log_and_print(f"[TriageManager] Round {round_id} processed — Adaptive T={T_flag:.3f}", log_file=self.log_dir)
 
         return combined
 

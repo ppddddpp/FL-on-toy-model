@@ -8,15 +8,15 @@ import time
 import hashlib
 from torch import nn
 from scipy.stats import median_abs_deviation as mad
-from torch.utils.hooks import RemovableHandle
+from pathlib import Path
+from Helpers.Helpers import log_and_print
+
+BASE_DIR = Path(__file__).resolve().parents[4]
 
 class ActivationOutlierDetector:
     """
     Detect activation-space anomalies that may indicate backdoor or trigger behavior.
     Collects internal activations on an anchor dataset and computes statistical drift.
-
-    This version auto-detects a sensible module to hook if the configured `layer_name`
-    substring is not present in the model.
     """
 
     def __init__(
@@ -24,11 +24,12 @@ class ActivationOutlierDetector:
         layer_name: str = "encoder",
         n_components: int = 2,
         outlier_threshold: float = 15.0,
-        max_samples: int = 128,
+        max_samples: int = 1024,
         ema_decay: float = 0.9,
         ema_enabled: bool = True,
         activation_reject_threshold: float = 0.3,
         eps: float = 1e-6,
+        log_dir: Path = BASE_DIR / "logs" / "run.txt",
     ):
         self.layer_name = layer_name
         self.n_components = n_components
@@ -49,12 +50,14 @@ class ActivationOutlierDetector:
         self.activation_reject_threshold = activation_reject_threshold
         self.eps = float(eps)
 
+        self.log_dir = log_dir
+
     def reset_ema(self):
         """Reset EMA drift tracking to its initial (None) state."""
         self._ema_mean = None
         self._ema_std = None
         self._ema_zmax = None
-        print("[ActivationOutlierDetector] EMA state reset.")
+        log_and_print("[ActivationOutlierDetector] EMA state reset.", log_file=self.log_dir)
 
     def _reset_hook_state(self):
         """Remove any previously-registered hook (defensive), reset transient hook bookkeeping."""
@@ -73,10 +76,10 @@ class ActivationOutlierDetector:
         """
         Return an exact module name (string) suitable for substring matching when registering hook.
         Preference order:
-          1. Any module name containing prefer_substr (if provided)
-          2. Any module name containing a preferred substring from list
-          3. First module instance that is Linear/Conv2d/Embedding/LayerNorm
-          4. None
+            1. Any module name containing prefer_substr (if provided)
+            2. Any module name containing a preferred substring from list
+            3. First module instance that is Linear/Conv2d/Embedding/LayerNorm
+            4. None
         """
         names_and_modules = list(model.named_modules())
         names = [n for n, _ in names_and_modules]
@@ -100,9 +103,25 @@ class ActivationOutlierDetector:
 
     def compute_zmax_distribution(self, global_model, anchor_loader, layer_name=None, max_samples=512):
         """
-        Run the model on anchor_loader and collect zmax for each batch/mini-collection.
-        Returns dict with summary stats and array of observed zmax values.
-        (This is for offline calibration / debugging.)
+        Compute the distribution of zmax values over a given dataset.
+
+        Parameters
+        ----------
+        global_model : torch.nn.Module
+            The model to use for computation.
+        anchor_loader : torch.utils.data.DataLoader
+            The data loader for the dataset over which to compute zmax.
+        layer_name : str, optional
+            The name of the module in which to compute zmax. If None, use self.layer_name.
+        max_samples : int, optional
+            The maximum number of samples to use for computation. Defaults to 512.
+
+        Returns
+        -------
+        dict
+            A dictionary containing the computed distribution of zmax values.
+            The dictionary has two keys: "zmax", which contains an array of zmax values,
+            and "summary", which contains a dictionary of summary statistics.
         """
         layer_name = layer_name or self.layer_name
         model = copy.deepcopy(global_model)
@@ -203,11 +222,8 @@ class ActivationOutlierDetector:
         Set self.outlier_threshold using either:
             - method="percentile": threshold = p-th percentile of baseline zmax
             - method="mad": threshold = median(zmax) + k_mad * MAD
-        If baseline_path provided, try to load saved baseline stats (and maybe zmax array you saved).
+        If baseline_path provided, try to load saved baseline stats (and maybe zmax array saved).
         """
-        # If baseline file contains a saved array of zmax values, you can load it; otherwise user should
-        # call compute_zmax_distribution() and pass results.
-        # For convenience, look if baseline_path is an npz with 'zmax' array
         baseline = None
         if baseline_path and os.path.exists(baseline_path):
             try:
@@ -225,17 +241,18 @@ class ActivationOutlierDetector:
                 baseline = None
 
         if baseline is None:
-            print("[ActivationOutlierDetector] No baseline zmax array provided or found; please call compute_zmax_distribution() first.")
+            log_and_print(f"[ActivationOutlierDetector] No baseline zmax array provided or found; " \
+                            f"please call compute_zmax_distribution() first.", log_file=self.log_dir)
             return False
 
         arr = np.asarray(baseline)
         if arr.size == 0:
-            print("[ActivationOutlierDetector] Baseline zmax array empty.")
+            log_and_print("[ActivationOutlierDetector] Baseline zmax array empty.", log_file=self.log_dir)
             return False
 
         if method == "percentile":
-            thr = float(np.percentile(arr, p))
-            bootstrap = float(np.percentile(arr, 50))  # median as a good EMA seed
+            thr = float(np.percentile(arr, p)) * 1.1 
+            bootstrap = float(np.percentile(arr, 75))  # median as a good EMA seed
         else:  # mad
             med = float(np.median(arr))
             m = float(mad(arr))
@@ -247,12 +264,33 @@ class ActivationOutlierDetector:
 
         # Initialize ema_zmax to a robust baseline point (median/percentile)
         self._ema_zmax = max(bootstrap, 1.0)
-        print(f"[ActivationOutlierDetector] outlier_threshold set -> {thr:.3f} (method={method}), ema_zmax init -> {self._ema_zmax:.3f}")
+        log_and_print(f"[ActivationOutlierDetector] outlier_threshold set -> {thr:.3f} (method={method}), ema_zmax init -> {self._ema_zmax:.3f}",
+                            log_file=self.log_dir)
+        
+        low, med, high = np.percentile(arr, [25, 50, 95])
+        log_and_print(f"[ActivationBaseline] Q25={low:.3f}, Q50={med:.3f}, Q95={high:.3f}, thr={self.outlier_threshold:.3f}", log_file=self.log_dir)
+
         return True
 
-    # -----------------------
-    # Compute (main)
-    # -----------------------
+    def apply_flat_update(self,model, flat_update: torch.Tensor):
+        """
+        Apply a flattened parameter update vector to a model.
+
+        Args:
+            model (torch.nn.Module): model whose parameters to update.
+            flat_update (torch.Tensor): 1D tensor containing concatenated deltas.
+        """
+        pointer = 0
+        with torch.no_grad():
+            for param in model.parameters():
+                numel = param.numel()
+                # slice the corresponding piece from the flat update
+                update_slice = flat_update[pointer:pointer + numel].view_as(param)
+                param.add_(update_slice.to(param.device))
+                pointer += numel
+        if pointer != flat_update.numel():
+            raise ValueError(f"Flat update size mismatch: used {pointer} / total {flat_update.numel()}")
+
     def compute(
         self,
         *,
@@ -262,8 +300,22 @@ class ActivationOutlierDetector:
         client_id: str = None,
     ) -> dict:
         """
-        Apply delta, collect activations, and compute anomaly metrics.
-        Returns a dict with activation metrics and a trust score S_activation.
+        Compute a trust score S_activation based on the activation distributions of the given model on the anchor dataset.
+
+        This function applies the client delta to the model parameters, collects activations of the model on the anchor dataset, and computes the trust score S_activation using the collected activations.
+
+        The trust score S_activation is a float between 0.0 and 1.0, with 1.0 indicating a high level of trust and 0.0 indicating a low level of trust.
+
+        The function returns a dict containing the trust score S_activation, the mean and standard deviation of the activations, the maximum z-score of the activations, the EMA-based drift, the PCA variance ratio, a privacy-safe activation hash, and the activation flag ("reject" or "pass").
+
+        Parameters:
+            global_model (torch.nn.Module): the model to evaluate
+            client_delta (dict): the client delta to apply to the model parameters
+            anchor_loader (torch.utils.data.DataLoader): the anchor dataset loader
+            client_id (str, optional): the client ID; defaults to None
+
+        Returns:
+            dict: a dictionary containing the trust score S_activation and other relevant information
         """
         # Ensure no stale hooks
         self._reset_hook_state()
@@ -280,10 +332,19 @@ class ActivationOutlierDetector:
                         if delta_tensor.shape == param.shape:
                             param.add_(delta_tensor)
                     except Exception as e:
-                        print(f"[ActivationCheck] {client_id}: delta apply failed on {name} ({e})")
+                        log_and_print(f"[ActivationCheck] {client_id}: delta apply failed on {name} ({e})", log_file=self.log_dir)
                 elif isinstance(client_delta, dict) and "_flat_update" in client_delta:
-                    # If flattened delta: skip or handle with an adapter (not implemented here)
-                    break
+                    for name, param in model.named_parameters():
+                        if name in client_delta:
+                            try:
+                                delta_tensor = client_delta[name].to(param.device)
+                                if delta_tensor.shape == param.shape:
+                                    param.add_(delta_tensor)
+                            except Exception as e:
+                                log_and_print(
+                                    f"[ActivationCheck] {client_id}: delta apply failed on {name} ({e})",
+                                    log_file=self.log_dir,
+                                )
 
         # --- Hook activations ---
         activations = []
@@ -305,7 +366,7 @@ class ActivationOutlierDetector:
 
         chosen_name = self._find_module_name_for_hook(model, prefer_substr=self.layer_name)
         if chosen_name is None:
-            print(f"[ActivationCheck] {client_id}: No suitable hook candidate found (tried '{self.layer_name}').")
+            log_and_print(f"[ActivationCheck] {client_id}: No suitable hook candidate found (tried '{self.layer_name}').", log_file=self.log_dir)
             return {"S_activation": 1.0, "activation_flag": "pass"}
 
         # Register hook on the first module whose name exactly matches chosen_name
@@ -324,14 +385,15 @@ class ActivationOutlierDetector:
                     break
 
         if handle is None:
-            print(f"[ActivationCheck] {client_id}: No layer matching '{self.layer_name}'/{chosen_name} found.")
+            log_and_print(f"[ActivationCheck] {client_id}: No layer matching '{self.layer_name}'/{chosen_name} found.", log_file=self.log_dir)
             return {"S_activation": 1.0, "activation_flag": "pass"}
 
         # store on self so reset is deterministic
         self._current_handle = handle
         self._current_hooked_module = hooked_module_name
 
-        print(f"[ActivationCheck] {client_id}: hooked module '{hooked_module_name}' (using preference '{self.layer_name}')")
+        log_and_print(f"[ActivationCheck] {client_id}: hooked module '{hooked_module_name}' (using preference '{self.layer_name}')",
+                        log_file=self.log_dir)
 
         # --- Collect activations on anchor dataset (ensure hook removal on all exits) ---
         try:
@@ -339,7 +401,7 @@ class ActivationOutlierDetector:
         except StopIteration:
             # empty model? treat as pass
             self._reset_hook_state()
-            print(f"[ActivationCheck] {client_id}: model has no parameters; skipping activation check.")
+            log_and_print(f"[ActivationCheck] {client_id}: model has no parameters; skipping activation check.", log_file=self.log_dir)
             return {"S_activation": 1.0, "activation_flag": "pass"}
 
         sample_count = 0
@@ -356,7 +418,7 @@ class ActivationOutlierDetector:
                         model(x)
                     except Exception as e:
                         # forward failed; return but ensure finally will cleanup hook
-                        print(f"[ActivationCheck] {client_id}: model forward failed during activation collection ({e})")
+                        log_and_print(f"[ActivationCheck] {client_id}: model forward failed during activation collection ({e})", log_file=self.log_dir)
                         return {"S_activation": 1.0, "activation_flag": "pass"}
 
                     sample_count += x.size(0)
@@ -368,7 +430,7 @@ class ActivationOutlierDetector:
 
         # activations should have been populated by the hook
         if not activations:
-            print(f"[ActivationCheck] {client_id}: No activations captured.")
+            log_and_print(f"[ActivationCheck] {client_id}: No activations captured.", log_file=self.log_dir)
             return {"S_activation": 1.0, "activation_flag": "pass"}
 
         acts = torch.cat(activations, dim=0).numpy()
@@ -376,7 +438,7 @@ class ActivationOutlierDetector:
 
         # --- Z-score drift detection ---
         if acts.size == 0 or acts.shape[1] == 0:
-            print(f"[ActivationCheck] {client_id}: activations empty after concat.")
+            log_and_print(f"[ActivationCheck] {client_id}: activations empty after concat.", log_file=self.log_dir)
             return {"S_activation": 1.0, "activation_flag": "pass"}
 
         # stable per-feature zscore
@@ -402,7 +464,7 @@ class ActivationOutlierDetector:
                     self._ema_std = (d * self._ema_std) + ((1.0 - d) * std_activation)
                     self._ema_zmax = (d * float(self._ema_zmax)) + ((1.0 - d) * float(zmax))
             except Exception as e:
-                print(f"[ActivationCheck] Warning: EMA update failed: {e}")
+                log_and_print(f"[ActivationCheck] Warning: EMA update failed: {e}", log_file=self.log_dir)
 
             drift_ema = abs(zmax - self._ema_zmax) / (self._ema_zmax + 1e-8)
         else:
@@ -414,7 +476,7 @@ class ActivationOutlierDetector:
             pca.fit(acts)
             var_ratio = float(np.sum(pca.explained_variance_ratio_))
         except Exception as e:
-            print(f"[ActivationCheck] {client_id}: PCA failed ({e})")
+            log_and_print(f"[ActivationCheck] {client_id}: PCA failed ({e})", log_file=self.log_dir)
             var_ratio = 0.0
 
         # --- Drift-based trust score ---
@@ -430,9 +492,10 @@ class ActivationOutlierDetector:
         S_activation = max(0.0, min(1.0, S_activation))
 
         # debug: print final, after all computed
-        print(
+        log_and_print(
             f"[ActivationCheck] {client_id}: zmax={zmax:.3f}, outlier_thr={self.outlier_threshold:.3f}, "
-            f"ema_zmax={self._ema_zmax:.3f}, drift_ema={drift_ema:.3f}, var_ratio={var_ratio:.3f}, S_act={S_activation:.3f}"
+            f"ema_zmax={self._ema_zmax:.3f}, drift_ema={drift_ema:.3f}, var_ratio={var_ratio:.3f}, S_act={S_activation:.3f}",
+            log_file=self.log_dir
         )
 
         # --- Privacy-safe activation hash ---
@@ -460,12 +523,9 @@ class ActivationOutlierDetector:
             "round_id": int(time.time())
         }
 
-    # -----------------------
-    # Baseline helpers
-    # -----------------------
     @staticmethod
     def build_baseline(global_model, anchor_loader, layer_name="features",
-                       max_samples=512, save_path="baseline_activation_stats.npz"):
+                        max_samples=512, save_path="baseline_activation_stats.npz"):
         """
         Compute and save baseline activation statistics from trusted (clean) data.
         Returns True on success, False if no suitable hook was found.

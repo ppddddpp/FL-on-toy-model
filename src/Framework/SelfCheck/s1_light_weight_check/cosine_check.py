@@ -11,6 +11,29 @@ def _normalize(vec: torch.Tensor) -> torch.Tensor:
 
 
 def _mean_direction(vectors, global_expected_len=None):
+    """
+    Compute mean direction of a list of vectors.
+
+    If all vectors have the same shape, simply compute the mean.
+    If vectors have different shapes, prefer to use vectors that match
+    the global_expected_len, otherwise use the majority shape.
+
+    Returns (mean_direction, flags) where mean_direction is the reference
+    direction and flags is a dictionary of shape mismatch flags for
+    each client. The flags are False if the client's vector matches
+    the chosen shape, and True otherwise.
+
+    Parameters
+    ----------
+    vectors : Sequence[torch.Tensor]
+        List of vectors to compute the mean direction from.
+    global_expected_len : Optional[int]
+        The expected length of vectors. If None, will not be considered.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, Dict[int, bool]]
+    """
     if len(vectors) == 0:
         raise ValueError("No vectors provided to _mean_direction")
 
@@ -129,7 +152,11 @@ class CosineCheck:
         precomputed_ref: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """
-        Compute reference direction and s_cos for all clients.
+        Compute s_cos for multiple clients.
+
+        Inputs:
+            - deltas: list of flattened client update tensors
+            - precomputed_ref: precomputed reference direction (optional)
 
         Returns dict:
             {

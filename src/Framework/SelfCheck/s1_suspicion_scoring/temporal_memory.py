@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 from typing import Dict, Any
+from Helpers.Helpers import log_and_print
+
+BASE_DIR = Path(__file__).resolve().parents[4]
 
 class TemporalMemory:
     """
@@ -8,10 +11,12 @@ class TemporalMemory:
     Tracks cumulative drift (temporal consistency) over rounds.
     """
 
-    def __init__(self, memory_file: Path, alpha: float = 0.2):
+    def __init__(self, memory_file: Path, alpha: float = 0.2, log_dir: Path = BASE_DIR / "logs" / "run.txt"):
         self.memory_file = memory_file
         self.alpha = alpha
-        self.state: Dict[str, Dict[str, float]] = {}  # {client_id: {metric: ema_val}}
+        self.state: Dict[str, Dict[str, float]] = {}  # {client_id: {metric: ema_val}},
+        self.log_dir = log_dir
+
         if self.memory_file.exists():
             try:
                 with open(self.memory_file, "r") as f:
@@ -43,4 +48,4 @@ class TemporalMemory:
             with open(self.memory_file, "w") as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
-            print(f"[TemporalMemory] Warning: save failed: {e}")
+            log_and_print(f"[TemporalMemory] Warning: save failed: {e}", log_file=self.log_dir)

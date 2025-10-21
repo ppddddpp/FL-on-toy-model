@@ -2,6 +2,7 @@ from typing import Sequence, Dict, Any, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from Helpers.Helpers import log_and_print
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[4]
@@ -36,7 +37,8 @@ class AdaptiveThreshold:
         semi_mode: bool = True,
         freeze_drift: float = 0.25,
         patience: int = 3,
-        checkpoint_path: Optional[str] = None
+        checkpoint_path: Optional[str] = None,
+        log_dir: Path = BASE_DIR / "logs" / "run.txt",
     ):
         """
         Initialize the adaptive thresholding component.
@@ -68,6 +70,8 @@ class AdaptiveThreshold:
             Number of consecutive rounds to wait before unfreezing.
         checkpoint_path : str, optional
             Path to load/store model checkpoints. If None, uses the default checkpoint path.
+        log_dir : Path, default=BASE_DIR / "logs" / "run.txt"
+            Path to the log file.
         """
         # Adaptive threshold
         self.base_T = float(base_T)
@@ -98,6 +102,9 @@ class AdaptiveThreshold:
 
         # Try to restore from previous checkpoint
         self._try_load()
+
+        # Logging
+        self.log_dir = log_dir
 
     def _rule_threshold(self, scores: Sequence[float]) -> float:
         """
@@ -181,7 +188,7 @@ class AdaptiveThreshold:
             if drift > self.freeze_drift:
                 self.freeze_counter += 1
                 if self.freeze_counter >= self.patience:
-                    print(f"[AutoFreeze] Drift {drift:.3f} exceeds limit. Model frozen.")
+                    log_and_print(f"[AutoFreeze] Drift {drift:.3f} exceeds limit. Model frozen.", log_file=self.log_dir)
                     self.is_frozen = True
             else:
                 self.freeze_counter = 0
@@ -232,7 +239,7 @@ class AdaptiveThreshold:
             }
         """
         if not data:
-            print("[ManualTrain] No data provided.")
+            log_and_print("[ManualTrain][Error] No data provided.", log_file=self.log_dir)
             return
 
         self.model.train()
@@ -256,11 +263,10 @@ class AdaptiveThreshold:
             loss.backward()
             self.opt.step()
             if epoch % 2 == 0 or epoch == epochs - 1:
-                print(f"[ManualTrain] Epoch {epoch+1}/{epochs} | Loss={loss.item():.6f}")
+                log_and_print(f"[ManualTrain] Epoch {epoch+1}/{epochs} | Loss={loss.item():.6f}")
 
         self.save()
-        print(f"[ManualTrain] Finished training on {len(data)} samples.")
-
+        log_and_print(f"[ManualTrain] Finished training on {len(data)} samples.", log_file=self.log_dir)
     
     def semi_auto_update(self, scores: Sequence[float], T_applied: float):
         """
@@ -283,7 +289,7 @@ class AdaptiveThreshold:
         self.opt.zero_grad()
         loss.backward()
         self.opt.step()
-        print(f"[SemiAuto] pseudo delta_T={pseudo_label:.4f} | weight={stability:.2f}")
+        log_and_print(f"[SemiAuto] pseudo delta_T={pseudo_label:.4f} | weight={stability:.2f}", log_file=self.log_dir)
         return float(loss.item())
 
     def compute_batch(self, scores_dict: Dict[str, float]) -> Dict[str, Any]:
@@ -321,19 +327,19 @@ class AdaptiveThreshold:
             "freeze_counter": self.freeze_counter,
         }
         np.save(self.state_path, state)
-        print(f"[Checkpoint] Saved model to {self.model_path}")
+        log_and_print(f"[Checkpoint] Saved model to {self.model_path}", log_file=self.log_dir)
 
     def _try_load(self):
         """Try loading previous checkpoint if available."""
         if self.model_path.exists():
             self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
-            print(f"[Checkpoint] Loaded MLP from {self.model_path}")
+            log_and_print(f"[Checkpoint] Loaded MLP from {self.model_path}")
         if self.state_path.exists():
             state = np.load(self.state_path, allow_pickle=True).item()
             self.prev_T = state.get("prev_T", None)
             self.is_frozen = state.get("is_frozen", False)
             self.freeze_counter = state.get("freeze_counter", 0)
-            print(f"[Checkpoint] Loaded state (prev_T={self.prev_T}, frozen={self.is_frozen})")
+            log_and_print(f"[Checkpoint] Loaded state (prev_T={self.prev_T}, frozen={self.is_frozen})", log_file=self.log_dir)
 
     def report(self, results: Dict[str, Any]):
         print("==== Adaptive Thresholding (Hybrid) ====")

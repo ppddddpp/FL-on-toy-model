@@ -13,6 +13,7 @@ from .kg_eval import KGConsistencyEvaluator
 from .signature_eval import SignatureEvaluator
 from .activation_eval import ActivationOutlierDetector
 from .calibration import SafeThresholdCalibrator
+from Helpers.Helpers import log_and_print, log_round_summary
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 DL_DIR = BASE_DIR / "deepcheck_ledger"
@@ -21,8 +22,7 @@ if not DL_DIR.exists():
 
 class DeepCheckManager:
     """
-    DeepCheckManager performs the full multi-level trust evaluation
-    for a client update in Federated Learning.
+    DeepCheckManager performs the full multi-level trust evaluation for a client update.
     """
 
     def __init__(
@@ -40,7 +40,8 @@ class DeepCheckManager:
         anchor_drop_tolerance: float = 0.05,
         anchor_loss_tolerance: float = 0.1,
         activation_reject_threshold: float = 0.3,
-        anchor_loader = None
+        anchor_loader = None,
+        log_dir: Path = BASE_DIR / "logs" / "run.txt",
     ):  
         """
         Initializes DeepCheckManager.
@@ -75,6 +76,8 @@ class DeepCheckManager:
             Threshold for activation outlier detection (default 30%).
         anchor_loader: DataLoader
             DataLoader for the anchor dataset (public / synthetic).
+        log_dir : Path
+            Path to log file
         """
         self.anchor_eval = anchor_eval or AnchorEvaluator(anchor_loader)
         self.kg_eval = kg_eval or KGConsistencyEvaluator()
@@ -106,6 +109,9 @@ class DeepCheckManager:
                 self.load_ref_sigs(str(_ref_path))
             except Exception:
                 pass
+        
+        self.log_dir = log_dir
+
 
     def _update_Lmax(self, L_check: float):
         self._rolling_L.append(L_check)
@@ -181,8 +187,8 @@ class DeepCheckManager:
     def reset_all_ema(self):
         """Reset EMA-related states for detectors (activation, etc.)."""
         if hasattr(self.activation_eval, "reset_ema"):
-            self.activation_eval.reset_ema()
-            print("[DeepCheckManager] Activation EMA reset.")
+            # self.activation_eval.reset_ema()
+            log_and_print("[DeepCheckManager] Activation EMA reset.", log_file=self.log_dir)
 
     def _get_ledger_path(self, round_id: int) -> Path:
         """Return ledger file path for the given round."""
@@ -214,7 +220,7 @@ class DeepCheckManager:
             except Exception:
                 return torch.tensor(v, dtype=torch.float32)
 
-        print(f"[DeepCheckManager] Normalizing client_delta for {client_id} (type={type(client_delta)})")
+        log_and_print(f"[DeepCheckManager] Normalizing client_delta for {client_id} (type={type(client_delta)})", log_file=self.log_dir)
 
         # Safe coercion for all possible formats
         try:
@@ -236,10 +242,10 @@ class DeepCheckManager:
                 # Unknown type fallback
                 client_delta = {}
         except Exception as e:
-            print(f"[DeepCheckManager] Warning: failed to normalize delta for {client_id}: {e}")
+            log_and_print(f"[DeepCheckManager] Warning: failed to normalize delta for {client_id}: {e}", log_file=self.log_dir)
             client_delta = {}
 
-        print(f"[DeepCheckManager] Normalized client_delta for {client_id} (type={type(client_delta)})")
+        log_and_print(f"[DeepCheckManager] Normalized client_delta for {client_id} (type={type(client_delta)})", log_file=self.log_dir)
 
         # Anchor Sandbox Validation
         sandbox_res = self.anchor_eval.sandbox_validate(
@@ -263,11 +269,15 @@ class DeepCheckManager:
                     "loss_increase": float(loss_increase),
                     "acc_drop": float(acc_drop)
                 }
-                print(f"[AnchorSandbox] Client {client_id} rejected — delta_Loss={loss_increase:.3f}, delta_Acc={acc_drop:.3f}")
+                log_and_print(f"[AnchorSandbox] Client {client_id} rejected — delta_Loss={loss_increase:.3f}, delta_Acc={acc_drop:.3f}",
+                        log_file=self.log_dir
+                    )
                 return {**results, "S_deep": 0.0}
             else:
                 results["sandbox_flag"] = "accept"
-                print(f"[AnchorSandbox] Client {client_id} passed sandbox — delta_Loss={loss_increase:.3f}, delta_Acc={acc_drop:.3f}")
+                log_and_print(f"[AnchorSandbox] Client {client_id} passed sandbox — delta_Loss={loss_increase:.3f}, delta_Acc={acc_drop:.3f}",
+                        log_file=self.log_dir
+                    )
         else:
             raise RuntimeError("Anchor sandbox validation failed.")
         
@@ -329,9 +339,9 @@ class DeepCheckManager:
                         client_sig = self.sig_eval.make_signature_from_delta(client_delta, dim=256, device="cpu")
                     else:
                         raise AttributeError("sig_eval has no encode/make_signature_from_delta")
-                    print(f"[SignatureCheck] Auto-generated client_sig for {client_id}")
+                    log_and_print(f"[SignatureCheck] Auto-generated client_sig for {client_id}", log_file=self.log_dir)
                 except Exception as e:
-                    print(f"[SignatureCheck] Failed to generate client_sig for {client_id}: {e}")
+                    log_and_print(f"[SignatureCheck] Failed to generate client_sig for {client_id}: {e}", log_file=self.log_dir)
                     client_sig = None
 
 
@@ -340,12 +350,12 @@ class DeepCheckManager:
                 stored_ref = self.ref_sigs.get(client_id)
                 if stored_ref is not None:
                     ref_sig = stored_ref
-                    print(f"[SignatureCheck] Using stored ref_sig for {client_id}")
+                    log_and_print(f"[SignatureCheck] Using stored ref_sig for {client_id}", log_file=self.log_dir)
                 else:
                     # DEV fallback (do not rely on this in production)
                     ref_sig = client_sig.clone() if client_sig is not None else None
                     if ref_sig is not None:
-                        print(f"[SignatureCheck] Using fallback self-reference for {client_id} (dev only)")
+                        log_and_print(f"[SignatureCheck] Using fallback self-reference for {client_id} (dev only)", log_file=self.log_dir)
 
             # Compute similarity if both available
             if client_sig is not None and ref_sig is not None:
@@ -372,11 +382,11 @@ class DeepCheckManager:
                         results["candidate_ref_sig"] = candidate.clone()
                         results["candidate_ref_score"] = S_sig
                         results["candidate_ref_ok"] = True
-                        print(f"[SignatureCheck] Candidate ref_sig computed for {client_id} (S_sig={S_sig:.3f})")
+                        log_and_print(f"[SignatureCheck] Candidate ref_sig computed for {client_id} (S_sig={S_sig:.3f})", log_file=self.log_dir)
                     else:
                         results["candidate_ref_ok"] = False
                 except Exception as e:
-                    print(f"[SignatureCheck] Warning: failed to compute candidate ref_sig for {client_id}: {e}")
+                    log_and_print(f"[SignatureCheck] Warning: failed to compute candidate ref_sig for {client_id}: {e}", log_file=self.log_dir)
                     results["candidate_ref_ok"] = False
 
             else:
@@ -403,7 +413,7 @@ class DeepCheckManager:
         S_activation = results.get("S_activation", 1.0)
         if S_activation < self.activation_reject_threshold:
             results["activation_flag"] = "reject"
-            print(f"[ActivationCheck] Client {client_id} rejected — S_act={S_activation:.3f}")
+            log_and_print(f"[ActivationCheck] Client {client_id} rejected — S_act={S_activation:.3f}", log_file=self.log_dir)
             return {**results, "S_final": 0.0}
 
         S_combined = (
@@ -413,10 +423,11 @@ class DeepCheckManager:
             (self.delta * S_activation)
         ) / (self.alpha + self.beta + self.gamma + self.delta)
 
-        print(
+        log_and_print(
             f"[DeepCheck DEBUG] client={client_id} "
             f"L_sig={L_sig:.6f} L_check={L_check:.6f} L_max={L_max:.6f} "
-            f"S_sig={results.get('S_sig', None)} S_activation={S_activation:.3f}"
+            f"S_sig={results.get('S_sig', None)} S_activation={S_activation:.3f}",
+            log_file=self.log_dir
         )
 
         results.update({
@@ -458,10 +469,10 @@ class DeepCheckManager:
 
             with open(ledger_file, "w") as f:
                 json.dump(existing, f, indent=2)
-            print(f"[Ledger] Logged entry for client {client_id} (round {round_id})")
+            log_and_print(f"[Ledger] Logged entry for client {client_id} (round {round_id})", log_file=self.log_dir)
 
         except Exception as e:
-            print(f"[Ledger] Warning: failed to write ledger for {client_id}: {e}")
+            log_and_print(f"[Ledger] Warning: failed to write ledger for {client_id}: {e}", log_file=self.log_dir)
 
         return results
     
@@ -518,7 +529,7 @@ class DeepCheckManager:
                     else:
                         precomputed_sigs[cid] = self.sig_eval.make_signature_from_delta(norm, dim=256, device="cpu")
                 except Exception as e:
-                    print(f"[DeepCheckManager] Warning: failed to precompute sig for {cid}: {e}")
+                    log_and_print(f"[DeepCheckManager] Warning: failed to precompute sig for {cid}: {e}", log_file=self.log_dir)
                     precomputed_sigs[cid] = None
 
         accepted_count = 0
@@ -563,19 +574,49 @@ class DeepCheckManager:
                 results[cid] = {"error": str(e)}
                 rejected_count += 1
                 rejected_reasons[cid] = str(e)
-                print(f"[DeepCheckManager] Client {cid} failed: {e}")
+                log_and_print(f"[DeepCheckManager] Client {cid} failed: {e}", log_file=self.log_dir)
+
+        # === Build structured per-client decisions ===
+        accepted_clients = []
+        rejected_clients = []
+        decisions = {}
+
+        for cid, res in results.items():
+            if cid == "_summary":
+                continue
+            flags = {k: v for k, v in res.items() if isinstance(k, str) and k.endswith("_flag")}
+            if any(v == "reject" for v in flags.values()):
+                decisions[cid] = {
+                    "action": "reject",
+                    "reason": next((k for k, v in flags.items() if v == "reject"), "unknown")
+                }
+                rejected_clients.append(cid)
+            else:
+                decisions[cid] = {"action": "accept"}
+                accepted_clients.append(cid)
 
         summary = {
             "num_clients": len(candidate_clients),
-            "accepted": accepted_count,
-            "rejected": rejected_count,
+            "accepted": accepted_clients,
+            "rejected": rejected_clients,
             "rejected_reasons": rejected_reasons,
-            "timestamp": time.time()
+            "timestamp": time.time(),
         }
 
-        print(f"[DeepCheckManager] Batch summary: {summary}")
+        log_round_summary(summary, log_dir=BASE_DIR / "logs")
+        log_and_print(f"[DeepCheckManager] Batch summary: {summary}", log_file=self.log_dir)
 
+        # Combine both detailed and summary outputs
+        for cid, dec in decisions.items():
+            if cid in results and isinstance(results[cid], dict):
+                results[cid].update(dec)  # keep S_final etc, just add 'action'/'reason'
+            else:
+                results[cid] = dec        # fallback if no detailed entry yet
+
+        results["accepted"] = accepted_clients
+        results["rejected"] = rejected_clients
         results["_summary"] = summary
+
         return results
 
     def auto_calibrate_thresholds(
@@ -611,7 +652,7 @@ class DeepCheckManager:
         if safe_calibrator is None:
             safe_calibrator = SafeThresholdCalibrator(self)
 
-        print(f"[DeepCheckManager] Auto-calibration triggered — {len(trusted_deltas)} trusted deltas.")
+        log_and_print(f"[DeepCheckManager] Auto-calibration triggered — {len(trusted_deltas)} trusted deltas.", log_file=self.log_dir)
 
         result = safe_calibrator.calibrate(
             global_model=global_model,
@@ -620,7 +661,7 @@ class DeepCheckManager:
         )
 
         if not result:
-            print("[DeepCheckManager] Calibration skipped — insufficient separation or samples.")
+            log_and_print("[DeepCheckManager] Calibration skipped — insufficient separation or samples.", log_file=self.log_dir)
             return {}
 
         # Log calibration results
@@ -640,9 +681,9 @@ class DeepCheckManager:
             existing.append(log_entry)
             with open(ledger_file, "w") as f:
                 json.dump(existing, f, indent=2)
-            print(f"[DeepCheckManager] Logged calibration event (round={round_id}).")
+            log_and_print(f"[DeepCheckManager] Logged calibration event (round={round_id}).", log_file=self.log_dir)
         except Exception as e:
-            print(f"[DeepCheckManager] Failed to log calibration: {e}")
+            log_and_print(f"[DeepCheckManager] Failed to log calibration: {e}", log_file=self.log_dir)
 
         return result
 
@@ -703,7 +744,7 @@ class DeepCheckManager:
         try:
             # If nothing changed on-disk, skip saving
             if os.path.exists(path) and self._ref_sigs_equal_on_disk(path):
-                print(f"[DeepCheckManager] ref_sigs unchanged on disk -> skipping save ({path})")
+                log_and_print(f"[DeepCheckManager] ref_sigs unchanged on disk -> skipping save ({path})", log_file=self.log_dir)
                 return True
 
             dirpath = os.path.dirname(path)
@@ -716,7 +757,7 @@ class DeepCheckManager:
                 tmpf.close()  # close before torch.save
                 torch.save(self.ref_sigs, tmp)
                 os.replace(tmp, path)  # atomic replace
-                print(f"[DeepCheckManager] Saved ref_sigs -> {path} (atomic)")
+                log_and_print(f"[DeepCheckManager] Saved ref_sigs -> {path} (atomic)", log_file=self.log_dir)
                 self._ref_sigs_dirty = False
                 return True
             finally:
@@ -726,23 +767,23 @@ class DeepCheckManager:
                     except Exception:
                         pass
         except Exception as e:
-            print(f"[DeepCheckManager] Failed to save ref_sigs: {e}")
+            log_and_print(f"[DeepCheckManager] Failed to save ref_sigs: {e}", log_file=self.log_dir)
             return False
 
     def load_ref_sigs(self, path: str):
         import os
         if not os.path.exists(path):
-            print(f"[DeepCheckManager] ref_sigs file not found: {path}")
+            log_and_print(f"[DeepCheckManager] ref_sigs file not found: {path}", log_file=self.log_dir)
             return False
         try:
             data = torch.load(path, map_location="cpu")
             if isinstance(data, dict):
                 self.ref_sigs = data
                 self._ref_sigs_dirty = False
-                print(f"[DeepCheckManager] Loaded ref_sigs from {path}")
+                log_and_print(f"[DeepCheckManager] Loaded ref_sigs from {path}", log_file=self.log_dir)
                 return True
         except Exception as e:
-            print(f"[DeepCheckManager] Failed to load ref_sigs: {e}")
+            log_and_print(f"[DeepCheckManager] Failed to load ref_sigs: {e}", log_file=self.log_dir)
         return False
 
     def commit_ref_sigs(self, accepted_candidates: Dict[str, torch.Tensor], path: Optional[str]=None):
@@ -753,7 +794,7 @@ class DeepCheckManager:
         This will update self.ref_sigs in-memory and then call save_ref_sigs atomically, but only if mutated.
         """
         if not accepted_candidates:
-            print("[DeepCheckManager] No candidate ref_sigs to commit.")
+            log_and_print("[DeepCheckManager] No candidate ref_sigs to commit.", log_file=self.log_dir)
             return False
 
         dst = path or str(DL_DIR / "ref_sigs.pt")
@@ -773,8 +814,8 @@ class DeepCheckManager:
             self._ref_sigs_dirty = True
             saved = self.save_ref_sigs(dst)
             if not saved:
-                print("[DeepCheckManager] Warning: commit_ref_sigs failed to save to disk.")
+                log_and_print("[DeepCheckManager] Warning: commit_ref_sigs failed to save to disk.", log_file=self.log_dir)
             return saved
         else:
-            print("[DeepCheckManager] No changes to ref_sigs (commit skipped).")
+            log_and_print("[DeepCheckManager] No changes to ref_sigs (commit skipped).", log_file=self.log_dir)
             return True

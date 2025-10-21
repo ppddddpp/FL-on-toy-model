@@ -16,6 +16,7 @@ from Framework.SelfCheck.s5_deep_check.deep_check_eval import DeepCheckManager
 from Framework.SelfCheck.s5_deep_check.kg_eval import KGConsistencyEvaluator
 from Framework.SelfCheck.s5_deep_check.signature_eval import SignatureEvaluator
 from Framework.SelfCheck.s5_deep_check.activation_eval import ActivationOutlierDetector
+from Helpers.Helpers import log_and_print
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CKPT_BASELINE = BASE_DIR / "checkpoints" / "base_model"
@@ -27,13 +28,15 @@ class Server:
     def __init__(self, model_cls, 
                     config=None, self_check: Any = None, anchor_loader: Any = None,
                     checkpoint_dir="checkpoints/base_model", device="cpu", dataset_path=None,
-                    text_col=None, label_col=None):
+                    text_col=None, label_col=None, 
+                    log_dir= BASE_DIR / "logs" / "run.txt"):
         
         self.model_cls = model_cls
         self.config = config if config else Config.load(BASE_DIR / "config" / "config.yaml")
         self.device = torch.device(device if isinstance(device, str) else device)
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else CKPT_BASELINE
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = log_dir
 
         # Dataset set up for base model
         self.dataset_path = BASE_DIR / "data" / "animal" / "base" / "base_model.csv" if dataset_path is None else dataset_path
@@ -54,7 +57,7 @@ class Server:
         else:
             # Load anchors and KG if available
             if anchor_loader is None:
-                print("[WARNING] [Server] No anchor loader provided.")
+                log_and_print("[WARNING] [Server] No anchor loader provided.", log_file=self.log_dir)
 
             kg_edges, label_map = [], {}
             entity_embeddings, entity2id = None, None
@@ -66,7 +69,7 @@ class Server:
                 emb_path = kg_dir / "node_embeddings_best.npy"
                 id_path = kg_dir / "node2id.json"
                 if emb_path.exists() and id_path.exists():
-                    print(f"[Server] Loading trained KG embeddings from {kg_dir}")
+                    log_and_print(f"[Server] Loading trained KG embeddings from {kg_dir}", log_file=self.log_dir)
                     entity_embeddings = torch.tensor(
                         np.load(emb_path),
                         dtype=torch.float32,
@@ -75,7 +78,7 @@ class Server:
                     with open(id_path, "r") as f:
                         entity2id = json.load(f)
                 else:
-                    print("[Server] No trained KG embeddings found — will fallback to symbolic KG only.")
+                    log_and_print("[Server] No trained KG embeddings found — will fallback to symbolic KG only.", log_file=self.log_dir)
 
                 # Load triples (for structure-based consistency)
                 triples_csv = kg_dir / "triples.csv"
@@ -84,14 +87,14 @@ class Server:
                         reader = csv.reader(f)
                         next(reader)  # skip header
                         kg_edges = {(int(h), int(t)) for h, _, t in reader}
-                    print(f"[Server] Loaded {len(kg_edges)} triples from KG.")
+                    log_and_print(f"[Server] Loaded {len(kg_edges)} triples from KG.", log_file=self.log_dir)
 
                 # Build label map based on base model's label2id
                 label_map = {v: k.lower() for k, v in self.base_label2id.items()}
 
 
             except Exception as e:
-                print(f"[Server] Failed to load KG: {e}")
+                log_and_print(f"[Server] Failed to load KG: {e}", log_file=self.log_dir)
 
             # Hybrid KG evaluator: supports both symbolic triples + learned embeddings
             self.kg_eval = KGConsistencyEvaluator(
@@ -118,7 +121,7 @@ class Server:
                 if self.ref_path.exists():
                     self.deep_check.load_ref_sigs(str(self.ref_path))
             except Exception as e:
-                print(f"[Server] Warning: failed to load deep_check ref_sigs: {e}")
+                log_and_print(f"[Server] Warning: failed to load deep_check ref_sigs: {e}", log_file=self.log_dir)
 
             self.selfcheck = SelfCheckManager(
                 global_model=self.global_model,
@@ -130,12 +133,12 @@ class Server:
             self.prepare_activation_baseline(
                 baseline_path=ACT_BASELINE / "activation_baseline.npz",
                 rebuild_if_missing=True,
-                max_samples=512,
-                percentile=99,
+                max_samples=1024,
+                percentile=99.5,
                 method="percentile"
             )
         except Exception as e:
-            print(f"[Server] Activation baseline setup failed: {e}")
+            log_and_print(f"[Server] Activation baseline setup failed: {e}", log_file=self.log_dir)
 
         self.global_ref_sig = None       # torch.Tensor or None
         self.global_ref_alpha = 0.1      # EMA update rate for global ref sig
@@ -147,9 +150,9 @@ class Server:
         self.kg_node2id_path = self.kg_dir / "node2id.json"
 
         if self.kg_emb_path.exists() and self.kg_node2id_path.exists():
-            print(f"[Server] Using KG embeddings from {self.kg_dir}")
+            log_and_print(f"[Server] Using KG embeddings from {self.kg_dir}", log_file=self.log_dir)
         else:
-            print("[Server] No trained KG embeddings found — clients will skip KG alignment.")
+            log_and_print("[Server] No trained KG embeddings found — clients will skip KG alignment.", log_file=self.log_dir)
             self.kg_dir = None
         self.calibrator = SafeThresholdCalibrator(self.selfcheck.deep_check)
 
@@ -165,12 +168,12 @@ class Server:
         if not isinstance(self.share_label_space, bool):
             self.share_label_space = cfg.share_label_space
 
-        print(f"[Server] Allow dynamic label expansion: {self.allow_dynamic_label_expansion}")
-        print(f"[Server] Share label space globally: {self.share_label_space}")
+        log_and_print(f"[Server] Allow dynamic label expansion: {self.allow_dynamic_label_expansion}", log_file=self.log_dir)
+        log_and_print(f"[Server] Share label space globally: {self.share_label_space}", log_file=self.log_dir)
 
         if not self.share_label_space:
-            print("[Server][Privacy Mode] Label sharing is DISABLED. "
-                "Clients’ new labels will be kept private and anonymized.")
+            log_and_print("[Server][Privacy Mode] Label sharing is DISABLED. "
+                "Clients’ new labels will be kept private and anonymized.", log_file=self.log_dir)
 
     def _load_or_train_base(self):
         latest_ckpt = self._get_latest_checkpoint()
@@ -196,7 +199,7 @@ class Server:
         ).to(self.device)
 
         if latest_ckpt is None:
-            print("[Server] No base model found, training new base model...")
+            log_and_print("[Server] No base model found, training new base model...", log_file=self.log_dir)
             trainer = BaseTrainer(
                 model=model,
                 train_dataset=train_ds,
@@ -214,18 +217,18 @@ class Server:
             torch.save(model.state_dict(), ckpt_path)
             latest_ckpt = ckpt_path
 
-        print(f"[Server] Loading base model from {latest_ckpt}")
+        log_and_print(f"[Server] Loading base model from {latest_ckpt}", log_file=self.log_dir)
         model.load_state_dict(torch.load(latest_ckpt, map_location=self.device))
         model.to(self.device)
 
-        print("\n[DEBUG] Base model constructed")
-        print(f"  Expected num_classes from dataset: {num_classes}")
+        log_and_print("\n[DEBUG] Base model constructed", log_file=self.log_dir)
+        log_and_print(f"  Expected num_classes from dataset: {num_classes}", log_file=self.log_dir)
         for name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 w = module.weight.shape
                 b = getattr(module, 'bias', None)
-                print(f"  Linear layer: {name:25s} weight={tuple(w)} "
-                    f"bias={None if b is None else tuple(b.shape)}")
+                log_and_print(f"  Linear layer: {name:25s} weight={tuple(w)} "
+                    f"bias={None if b is None else tuple(b.shape)}", log_file=self.log_dir)
 
         return model, vocab, label2id
 
@@ -244,7 +247,7 @@ class Server:
         - otherwise compute zmax distribution on anchor_loader and set threshold
         """
         if self.selfcheck is None or self.selfcheck.anchor_loader is None:
-            print("[Server] No anchor_loader available — cannot build activation baseline.")
+            log_and_print("[Server] No anchor_loader available — cannot build activation baseline.", log_file=self.log_dir)
             return False
 
         detector = self.act  # ActivationOutlierDetector instance
@@ -254,15 +257,15 @@ class Server:
         if baseline_path.exists():
             try:
                 detector.load_baseline(str(baseline_path))
-                print(f"[Server] Loaded activation baseline from {baseline_path}")
+                log_and_print(f"[Server] Loaded activation baseline from {baseline_path}", log_file=self.log_dir)
                 return True
             except Exception as e:
-                print(f"[Server] Failed to load baseline: {e}")
+                log_and_print(f"[Server] Failed to load baseline: {e}",log_file=self.log_dir)
                 if not rebuild_if_missing:
                     return False
 
         # Compute empirical zmax distribution (may take a few seconds)
-        print("[Server] Computing activation zmax distribution for baseline...")
+        log_and_print("[Server] Computing activation zmax distribution for baseline...", log_file=self.log_dir)
         dist = detector.compute_zmax_distribution(
             global_model=self.global_model,
             anchor_loader=self.selfcheck.anchor_loader,
@@ -272,15 +275,16 @@ class Server:
 
         zarr = dist.get("zmax", None)
         if zarr is None or zarr.size == 0:
-            print("[Server] Baseline zmax computation returned no data; baseline not created.")
+            log_and_print("[Server] Baseline zmax computation returned no data; baseline not created.", log_file=self.log_dir)
             return False
 
         # Save baseline array (so future restarts can load quickly)
         np.savez(str(baseline_path), zmax=zarr)
-        print(f"[Server] Saved activation baseline -> {baseline_path}")
+        log_and_print(f"[Server] Saved activation baseline -> {baseline_path}", log_file=self.log_dir)
 
         # Set threshold from that file (percentile or mad) and initialize ema_zmax
         detector.set_threshold_from_baseline(str(baseline_path), method=method, p=percentile)
+        detector.outlier_threshold *= 5.0
         return True
 
     def get_kg_info(self):
@@ -340,7 +344,7 @@ class Server:
                     else:
                         flat_v = flat_v[:target.numel()]
                     v = flat_v.view_as(target)
-                    print(f"[Aggregator] Adjusted param '{k}' -> {target.shape}")
+                    log_and_print(f"[Aggregator] Adjusted param '{k}' -> {target.shape}", log_file=self.log_dir)
                 new_state[k] += v * w
 
         return new_state
@@ -366,7 +370,7 @@ class Server:
         else:
             ckpt_path = self.checkpoint_dir / "final.pt"
         torch.save(global_weights, ckpt_path)
-        print(f"[Server] Saved global model -> {ckpt_path}")
+        log_and_print(f"[Server] Saved global model -> {ckpt_path}", log_file=self.log_dir)
 
     def evaluate_global(self, dataset, batch_size=16):
         """Evaluate current global model on given dataset (returns accuracy float)."""
@@ -382,7 +386,7 @@ class Server:
                 correct += (preds == y).sum().item()
                 total += y.size(0)
         acc = float(correct / total) if total > 0 else 0.0
-        print(f"[Server] Global Model Accuracy: {acc:.4f}")
+        log_and_print(f"[Server] Global Model Accuracy: {acc:.4f}", log_file=self.log_dir)
         return acc
     
     def flatten_state_dict_to_tensor(self, state_dict, key_order=None):
@@ -421,9 +425,9 @@ class Server:
             with open(ledger_path, "w") as f:
                 json.dump(existing, f, indent=2)
 
-            print(f"[Ledger] Logged round {entry['round']} entry for client {entry['client_id']}")
+            log_and_print(f"[Ledger] Logged round {entry['round']} entry for client {entry['client_id']}", log_file=self.log_dir)
         except Exception as e:
-            print(f"[Ledger] Warning: failed to update ledger for {entry.get('client_id', '?')}: {e}")
+            log_and_print(f"[Ledger] Warning: failed to update ledger for {entry.get('client_id', '?')}: {e}", log_file=self.log_dir)
 
     def safe_load_state_dict(self, model, state_dict):
         """
@@ -436,16 +440,16 @@ class Server:
             if k in model_dict and model_dict[k].shape == v.shape:
                 compatible[k] = v.to(model_dict[k].device)
             else:
-                print(f"[SafeLoad] Skipping {k}: shape {getattr(v, 'shape', None)}")
-                print (f" expected {model_dict.get(k).shape if k in model_dict else 'MISSING'}")
+                log_and_print(f"[SafeLoad] Skipping {k}: shape {getattr(v, 'shape', None)}", log_file=self.log_dir)
+                log_and_print(f" expected {model_dict.get(k).shape if k in model_dict else 'MISSING'}", log_file=self.log_dir)
         
         model.load_state_dict(compatible, strict=False)
-        print(f"[SafeLoad] Loaded {len(compatible)} params (strict=False).")
+        log_and_print(f"[SafeLoad] Loaded {len(compatible)} params (strict=False).", log_file=self.log_dir)
 
 
         model_dict.update(compatible)
         model.load_state_dict(model_dict)
-        print(f"[SafeLoad] Loaded {len(compatible)}/{len(model_dict)} params successfully.")
+        log_and_print(f"[SafeLoad] Loaded {len(compatible)}/{len(model_dict)} params successfully.", log_file=self.log_dir)
 
     def sync_labels_and_expand_model(self, client_label_sets):
         """
@@ -458,7 +462,7 @@ class Server:
         if not new_labels:
             return
 
-        print(f"[Server] New labels discovered from clients: {new_labels}")
+        log_and_print(f"[Server] New labels discovered from clients: {new_labels}", log_file=self.log_dir)
         next_id = max(self.base_label2id.values()) + 1
         for label in sorted(new_labels):
             self.base_label2id[label] = next_id
@@ -472,12 +476,12 @@ class Server:
             if isinstance(module, torch.nn.Linear):
                 classifier = module
         if classifier is None:
-            print("[Server] Warning: no classifier layer found to expand.")
+            log_and_print("[Server] Warning: no classifier layer found to expand.", log_file=self.log_dir)
             return
 
         old_w = classifier.weight.data
         old_shape = old_w.shape
-        print(f"[Server] Expanding classifier: old weight shape = {old_shape}")
+        log_and_print(f"[Server] Expanding classifier: old weight shape = {old_shape}", log_file=self.log_dir)
 
         # --- Determine orientation more robustly ---
         # if first dim == old num_labels → row_labels orientation
@@ -502,7 +506,7 @@ class Server:
                 new_b = torch.zeros((num_labels,), device=old_b.device, dtype=old_b.dtype)
                 new_b[:old_num_labels] = old_b
                 classifier.bias = torch.nn.Parameter(new_b)
-            print(f"[Server] Expanded (row_labels) -> new shape {classifier.weight.shape}")
+            log_and_print(f"[Server] Expanded (row_labels) -> new shape {classifier.weight.shape}", log_file=self.log_dir)
 
         else:
             # expand along columns (hidden_dim, num_labels)
@@ -516,20 +520,21 @@ class Server:
                 new_b = torch.zeros((num_labels,), device=old_b.device, dtype=old_b.dtype)
                 new_b[:old_num_labels] = old_b
                 classifier.bias = torch.nn.Parameter(new_b)
-            print(f"[Server] Expanded (col_labels) -> new shape {classifier.weight.shape}")
+            log_and_print(f"[Server] Expanded (col_labels) -> new shape {classifier.weight.shape}", log_file=self.log_dir)
 
     def run_round(self, round_id, client_updates):
         """
         Full FL round:
         SelfCheckManager -> DeepCheck -> Ledger -> Reputation -> Weighted Aggregation.
         - Uses staged candidate ref_sigs from DeepCheckManager and commits them
-          atomically only for fully trusted clients after acceptance decisions.
+            atomically only for fully trusted clients after acceptance decisions.
         """
-        print(f"\n[Server] --- Round {round_id} starting ---")
+        log_and_print(f"\n[Server] --- Round {round_id} starting ---", log_file=self.log_dir)
 
         # Reset activation EMA at start of round to avoid unwanted cross-round statefulness.
         try:
-            self.deep_check.reset_all_ema()
+            # self.deep_check.reset_all_ema()
+            pass
         except Exception:
             # best-effort; continue even if not available
             pass
@@ -540,7 +545,7 @@ class Server:
             # Expand classifier if allowed
             if self.share_label_space:
                 self.sync_labels_and_expand_model(client_label_sets)
-                print("[Server] Label space expanded globally and shared with all clients.")
+                log_and_print("[Server] Label space expanded globally and shared with all clients.", log_file=self.log_dir)
             else:
                 # Privacy-preserving mode — expand internally only
                 private_label_union = set().union(*client_label_sets)
@@ -548,7 +553,7 @@ class Server:
                 unseen_private_labels = private_label_union - current_labels
 
                 if unseen_private_labels:
-                    print(f"[Server] [Privacy Mode] Detected {len(unseen_private_labels)} new private labels.")
+                    log_and_print(f"[Server] [Privacy Mode] Detected {len(unseen_private_labels)} new private labels.", log_file=self.log_dir)
                     # Expand classifier internally but DO NOT expose label names
                     self.sync_labels_and_expand_model([current_labels | unseen_private_labels])
 
@@ -564,8 +569,8 @@ class Server:
                 current_labels = set(self.base_label2id.keys())
                 unseen = set().union(*client_label_sets) - current_labels
                 if unseen:
-                    print(f"[Server][Warning] Unseen labels detected but expansion disabled "
-                        f"({len(unseen)} new labels withheld).")
+                    log_and_print(f"[Server][Warning] Unseen labels detected but expansion disabled "
+                        f"({len(unseen)} new labels withheld).", log_file=self.log_dir)
 
         # Build input dict for SelfCheckManager / DeepCheckManager
         client_struct_updates = {}
@@ -618,6 +623,38 @@ class Server:
             ref_sigs=ref_sigs_to_send,
         )
 
+        # --- Summarize accept/reject per round ---
+        try:
+            summary_path = Path(BASE_DIR / "logs/client_accept_summary.json")
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+            round_summary = {}
+            for cid in public_out.get("trust_scores_quantized", {}).keys():
+                t = public_out["trust_scores_quantized"][cid]
+                if t is None:
+                    sym = "hold/"
+                elif float(t) <= 0.0:
+                    sym = "reject/"
+                else:
+                    sym = "accept/"
+                round_summary[cid] = sym
+
+            # Append to persistent summary file
+            existing = {}
+            if summary_path.exists():
+                try:
+                    existing = json.loads(summary_path.read_text())
+                except Exception:
+                    existing = {}
+
+            for cid, sym in round_summary.items():
+                existing.setdefault(cid, []).append(sym)
+
+            summary_path.write_text(json.dumps(existing, indent=2))
+            log_and_print(f"[Server] Saved accept/reject summary to {summary_path}", log_file=self.log_dir)
+        except Exception as e:
+            log_and_print(f"[Server] Warning: failed to log accept summary — {e}", log_file=self.log_dir)
+
         # canonicalize accepted / downweighted / rejected lists
         accepted_client_ids = public_out.get("accepted", []) or []
         downweighted = public_out.get("downweighted", []) or []
@@ -631,53 +668,6 @@ class Server:
             all_cids = [cu["client_id"] for cu in client_updates]
             rejected = [cid for cid in all_cids if cid not in accepted and cid not in downweighted]
 
-        # ----- IMPORTANT: collect deep-check results separately to obtain candidate_ref_sig -----
-        # We call deep_check.run_batch to extract per-client candidate_ref_sig and debug metrics
-        try:
-            deep_results = self.deep_check.run_batch(
-                global_model=self.global_model,
-                client_deltas=client_struct_updates,
-                client_sigs=client_sigs,
-                ref_sigs=ref_sigs_to_send,
-                anchor_loader=self.selfcheck.anchor_loader,
-            )
-        except Exception as e:
-            print(f"[Server] Warning: deep_check.run_batch failed: {e}")
-            deep_results = {}
-
-        # Debug print L_sig / L_max / S_sig / S_activation per-client (C)
-        candidate_ref_pool = {}
-        for cid, res in deep_results.items():
-            if cid == "_summary":
-                continue
-            try:
-                L_sig = res.get("L_sig", None)
-                L_max = res.get("L_max", None)
-                S_sig = res.get("S_sig", None)
-                S_activation = res.get("S_activation", None)
-                print(f"[DeepCheck DBG] {cid}: L_sig={L_sig} L_max={L_max} S_sig={S_sig} S_act={S_activation}")
-                # collect candidate ref sigs (staged by deep_check as 'candidate_ref_sig')
-                if res.get("candidate_ref_ok"):
-                    candidate_ref_pool[cid] = res.get("candidate_ref_sig")
-            except Exception:
-                pass
-
-        # Determine which candidate refs to commit:
-        # Only commit refs for clients that were accepted (fully trusted).
-        accepted_candidates = {cid: candidate_ref_pool[cid] for cid in accepted if cid in candidate_ref_pool}
-
-        if accepted_candidates:
-            try:
-                committed_ok = self.deep_check.commit_ref_sigs(accepted_candidates, path=str(self.ref_path))
-                if committed_ok:
-                    print(f"[Server] Committed {len(accepted_candidates)} ref_sigs for accepted clients.")
-                else:
-                    print("[Server] Warning: commit_ref_sigs returned False.")
-            except Exception as e:
-                print(f"[Server] Warning: failed to commit ref_sigs: {e}")
-        else:
-            print("[Server] No candidate ref_sigs to commit for accepted clients this round.")
-
         # Update global_ref_sig from trusted_sigs (same logic as before)
         trusted_sigs = [client_sigs[cid] for cid in accepted if cid in client_sigs and client_sigs[cid] is not None]
         if len(trusted_sigs) >= self.min_trusted_for_global:
@@ -687,7 +677,7 @@ class Server:
             else:
                 alpha = float(self.global_ref_alpha)
                 self.global_ref_sig = (alpha * mean_sig.detach().cpu()) + ((1.0 - alpha) * self.global_ref_sig)
-            print(f"[Server] Updated global_ref_sig from {len(trusted_sigs)} trusted clients")
+            log_and_print(f"[Server] Updated global_ref_sig from {len(trusted_sigs)} trusted clients", log_file=self.log_dir)
 
         # Atomically save global_ref_sig if present (do not overwrite ref_sigs here)
         try:
@@ -696,7 +686,7 @@ class Server:
                 torch.save(self.global_ref_sig.detach().cpu(), tmpg)
                 os.replace(tmpg, str(self.ref_path.with_name("global_ref_sig.pt")))
         except Exception as e:
-            print(f"[Server] Warning: failed to save global_ref_sig: {e}")
+            log_and_print(f"[Server] Warning: failed to save global_ref_sig: {e}", log_file=self.log_dir)
 
         # Build trust_scores mapping (fallback)
         if "trust_scores_quantized" in public_out:
@@ -718,7 +708,9 @@ class Server:
             cid = cu["client_id"]
             trust = float(trust_scores.get(cid, 1.0))
             old_rep = self.reputation_store.get(cid, 0.5)
-            new_rep = 0.9 * old_rep + 0.1 * trust
+
+            # Update reputation
+            new_rep = 0.5 * old_rep + 0.5 * trust
             self.reputation_store[cid] = new_rep
 
             entry = {
@@ -744,5 +736,7 @@ class Server:
         self.safe_load_state_dict(self.global_model, new_global)
         self.save_checkpoint(new_global, round_num=round_id)
 
-        print(f"[Server] Round {round_id} completed | Aggregated {len(agg_inputs)} clients.")
+        log_and_print(f"[Server] Round {round_id} completed | Aggregated {len(agg_inputs)} clients.", log_file=self.log_dir)
+
+
         return public_out

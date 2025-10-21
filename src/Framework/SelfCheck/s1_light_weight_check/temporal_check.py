@@ -2,14 +2,19 @@ from typing import Optional, Dict, Any
 import numpy as np
 from collections import defaultdict, deque
 import torch
+from Helpers.Helpers import log_and_print
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parents[4]
 
 class TemporalCheck:
     """
     Temporal instability detector (adaptive + cross-round difference version).
     """
 
-    def __init__(self, window_size: int = 5, V_max: float = 0.1, eps: float = 1e-12, adaptive: bool = False):
+    def __init__(self, window_size: int = 5, V_max: float = 0.1, 
+                    eps: float = 1e-12, adaptive: bool = False,
+                    log_dir: Path = BASE_DIR / "logs" / "run.txt"):
         """
         Parameters
         ----------
@@ -21,6 +26,8 @@ class TemporalCheck:
             Small epsilon to prevent divide-by-zero.
         adaptive : bool
             If True, adapt V_max each round using median variance across clients.
+        log_dir : Path
+            Directory for logging.
         """
         self.window_size = int(window_size)
         self.V_max = float(V_max)
@@ -29,6 +36,7 @@ class TemporalCheck:
         self.history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=self.window_size))
         self.prev_round: Dict[str, torch.Tensor] = {}
         self.initial_Vmax = V_max
+        self.log_dir = log_dir
 
     # -----------------------
     # Update / compute logic
@@ -94,7 +102,7 @@ class TemporalCheck:
             new_vmax = (1 - alpha) * self.V_max + alpha * median_var
             new_vmax = max(new_vmax, self.eps, 0.5 * self.initial_Vmax)
             if abs(new_vmax - self.V_max) / (self.V_max + 1e-12) > 0.2:
-                print(f"[TemporalCheck] Adjusting V_max: {self.V_max:.5f} → {new_vmax:.5f}")
+                log_and_print(f"[TemporalCheck] Adjusting V_max: {self.V_max:.5f} -> {new_vmax:.5f}", log_dir=self.log_dir)
             self.V_max = new_vmax
 
         # --- Save current updates for next round comparison

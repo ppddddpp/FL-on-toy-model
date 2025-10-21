@@ -37,6 +37,7 @@ calib_interval: 10          # number of epochs between calibrations
 
 # FL parameters
 allow_dynamic_label_expansion: True
+share_label_space: true
 
 # Wandb parameters
 project_name: "fl-toy-experiments"

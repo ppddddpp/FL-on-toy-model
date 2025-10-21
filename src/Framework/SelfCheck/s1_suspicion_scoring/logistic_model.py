@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
+from Helpers.Helpers import log_and_print
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 
@@ -18,7 +19,8 @@ class LogisticScoring(nn.Module):
         T_flag: float = 0.1,
         device: str = "cpu",
         pretrained_path: Optional[str] = None,
-        auto_load: bool = True
+        auto_load: bool = True,
+        log_dir: Path = BASE_DIR / "logs" / "run.txt"
     ):
         """
         Initialize the LogisticScoring model.
@@ -48,6 +50,7 @@ class LogisticScoring(nn.Module):
         self.device = torch.device(device)
         self.to(self.device)
         self.optimizer = optim.SGD(self.parameters(), lr=lr)
+        self.log_dir = log_dir
 
         # Try auto-loading pretrained weights
         if auto_load:
@@ -57,11 +60,11 @@ class LogisticScoring(nn.Module):
             if default_path.exists():
                 try:
                     self.load_state_dict(torch.load(default_path, map_location=self.device))
-                    print(f"[LogisticScoring] Loaded pretrained weights from: {default_path}")
+                    log_and_print(f"[LogisticScoring] Loaded pretrained weights from: {default_path}", log_file=self.log_dir)
                 except Exception as e:
-                    print(f"[LogisticScoring] Warning: failed to load pretrained model at {default_path}: {e}")
+                    log_and_print(f"[LogisticScoring] Warning: failed to load pretrained model at {default_path}: {e}", log_file=self.log_dir)
             else:
-                print(f"[LogisticScoring] No pretrained model found at {default_path} — using random init.")
+                log_and_print(f"[LogisticScoring] No pretrained model found at {default_path} — using random init.", log_file=self.log_dir)
 
     # Forward / compute logic
     def forward(self, x: torch.Tensor) -> torch.Tensor:

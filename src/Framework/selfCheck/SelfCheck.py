@@ -23,6 +23,7 @@ from .s2_similarity_scan.similarity_scan import SimilarityScanDetector
 from .s3_subset_aggregation.subset_aggregation import SubsetAggregationDetector
 from .s4_cluster_detection.cluster_detection import ClusterDetector
 from .s5_deep_check.deep_check_eval import DeepCheckManager
+from Helpers.Helpers import log_and_print
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 SH_LOG_DIR = BASE_DIR / "scheduler_log"
@@ -48,6 +49,7 @@ class SelfCheckManager:
                     deep_check=None,
                     global_model=None,
                     anchor_loader=None,
+                    log_dir= BASE_DIR / "logs" / "run.txt",
                     **kwargs
                     ):
 
@@ -133,12 +135,7 @@ class SelfCheckManager:
 
         # whether to return only inclusion mask (True -> returns accepted list only)
         self.return_only_mask = kwargs.get("return_only_mask", False)
-
-    def should_skip_deepcheck(self, anomaly_rate: float) -> bool:
-        # Return True sometimes when system is calm
-        if anomaly_rate < self.calm_threshold and random.random() < 0.3:
-            return True
-        return False
+        self.log_dir = log_dir if log_dir is not None else BASE_DIR / "logs" / "run.txt"
 
     def _evaluate_anchor_accs(self, all_updates: dict, global_model: torch.nn.Module) -> list:
         """
@@ -207,60 +204,58 @@ class SelfCheckManager:
                     total += y.size(0)
             acc = correct / max(1, total)
             anchor_accs.append(acc)
-            print(f"[ChallengeCheck] {cid}: anchor_acc={acc:.4f}")
+            log_and_print(f"[ChallengeCheck] {cid}: anchor_acc={acc:.4f}", log_file=self.log_dir)
 
         return anchor_accs
 
-    def schedule_deepcheck(self, triage_result: Dict[str, Any], escalated_clients: list, round_id: int):
+    def schedule_deepcheck(
+        self,
+        triage_result: Dict[str, Any],
+        mid_stage_info: Dict[str, Any],
+        escalated_clients: list,
+        round_id: int,
+        survivors: Optional[list] = None,
+    ):
         """
-        Adaptive DeepCheck scheduler:
-        - Always include escalated/flagged clients
-        - Randomly sample some normal clients with adaptive prob p
-        - Sometimes skip DeepCheck entirely if system is calm
+        Adaptive DeepCheck scheduler (strict mode):
+        - Only considers clients that survived previous stages
+        - Always DeepChecks escalated or flagged clients
+        - Randomly audits a subset of normal survivors
+        - Never skips DeepCheck entirely
         """
+        all_clients = set(survivors or [])
+        if not all_clients:
+            return []
+
         flags = triage_result.get("flags", {})
-        suspicious = set(escalated_clients or []) | {cid for cid, f in flags.items() if f}
-        all_clients = set(flags.keys())
+        subset_flags = set(mid_stage_info.get("flagged_s1", []))
+        similar_flags = set(mid_stage_info.get("flagged_s2", []))
+        cluster_flags = set(mid_stage_info.get("cluster_rejects", []))
+        all_flags = subset_flags | similar_flags | cluster_flags
+
+        # Combine suspicion sources
+        suspicious = (
+            set(escalated_clients or [])
+            | {cid for cid, f in flags.items() if f and cid in all_clients}
+            | (all_flags & all_clients)
+        )
         normal_clients = list(all_clients - suspicious)
 
-        # compute anomaly rate
+        # Adaptive random audit among normal survivors
         anomaly_rate = len(suspicious) / max(1, len(all_clients))
         self.last_anomaly_rate = anomaly_rate
 
-        # adaptive sampling probability (base + scale)
         p = min(self.deepcheck_base_prob + 0.6 * anomaly_rate, self.deepcheck_max_prob)
-
-        # random sample count among normal clients
         random_count = max(self.min_random_clients, int(len(normal_clients) * p))
         random_clients = random.sample(normal_clients, min(random_count, len(normal_clients))) if normal_clients else []
 
-        # optional skip when calm
-        if self.should_skip_deepcheck(anomaly_rate):
-            print(f"[DeepCheckScheduler] Round {round_id}: system calm (anomaly={anomaly_rate:.2%}) → skipping DeepCheck")
-            return []
-
         selected = sorted(list(suspicious | set(random_clients)))
-        print(
-            f"[DeepCheckScheduler] Round {round_id}: {len(suspicious)} flagged + {len(random_clients)} random "
-            f"-> total {len(selected)} (p={p:.2f}, anomaly={anomaly_rate:.2%})"
-        )
 
-        # Save scheduler metadata per round
-        log_entry = {
-            "round": round_id,
-            "anomaly_rate": anomaly_rate,
-            "sampling_prob": p,
-            "num_flagged": len(suspicious),
-            "num_random": len(random_clients),
-            "num_selected": len(selected)
-        }
-        log_path = SH_LOG_DIR / "deepcheck_schedule_log.json"
-        log_path.parent.mkdir(exist_ok=True)
-        try:
-            with open(log_path, "a") as f:
-                f.write(json.dumps(log_entry) + "\n")
-        except Exception as e:
-            print(f"[DeepCheckScheduler] Warning: Failed to log — {e}")
+        log_and_print(
+            f"[DeepCheckScheduler] Round {round_id}: {len(suspicious)} suspicious + {len(random_clients)} random "
+            f"-> total={len(selected)} (p={p:.2f}, survivors={len(all_clients)}, anomaly={anomaly_rate:.2%})",
+            log_file=self.log_dir
+        )
 
         return selected
 
@@ -337,7 +332,7 @@ class SelfCheckManager:
         # Report shape mismatches
         for cid, arr in client_deltas.items():
             if arr.size != expected_len:
-                print(f"[SelfCheck] STRUCTURAL mismatch: {cid} ({arr.size} vs {expected_len})")
+                log_and_print(f"[SelfCheck] STRUCTURAL mismatch: {cid} ({arr.size} vs {expected_len})", log_file=self.log_dir)
 
         # ===============================================================
         # Stage 1: Lightweight checks + triage
@@ -348,8 +343,8 @@ class SelfCheckManager:
             all_updates[cid] = flat_t.clone().detach().float()
 
         all_norms = [torch.norm(u).item() for u in all_updates.values()]
-
         base_norm = torch.norm(global_flat).item()
+
         norm_batch = self.norm_check.compute_batch([n / base_norm for n in all_norms])
         cos_batch = self.cos_check.compute_batch(list(all_updates.values()))
         sig_batch = self.sig_check.compute_from_deltas(list(all_updates.values()))
@@ -373,50 +368,101 @@ class SelfCheckManager:
             }
 
         self.temp_check.prev_round = {cid: u.clone().detach() for cid, u in all_updates.items()}
-        print(f"\n[SelfCheck] --- Stage 1: Lightweight feature summary (Round {round_id}) ---")
+        log_and_print(f"\n[SelfCheck] --- Stage 1: Lightweight feature summary (Round {round_id}) ---", log_file=self.log_dir)
         for cid, f in features.items():
-            print(f"  {cid}: " + " | ".join(f"{k}={v:.4f}" for k,v in f.items()))
+            log_and_print(f"  {cid}: " + " | ".join(f"{k}={v:.4f}" for k,v in f.items()), log_file=self.log_dir)
 
         result = self.triage.step(features, round_id)
 
+        early_reject = [cid for cid, dec in result.get("decisions", {}).items() if dec == "REJECT"]
+        if early_reject:
+            log_and_print(f"[SelfCheck] Early rejecting {len(early_reject)} clients: {early_reject}",
+                        log_file=self.log_dir)
+
+            remaining_after_early = [cid for cid in all_updates_param_dicts.keys() if cid not in early_reject]
+            log_and_print(
+                f"[SelfCheck] Remaining clients after Stage 1 (triage): "
+                f"{len(remaining_after_early)}/{len(client_updates)} -> {remaining_after_early}",
+                log_file=self.log_dir
+            )
+
+            # Drop them from all later stage inputs
+            client_deltas = {cid: delta for cid, delta in client_deltas.items() if cid not in early_reject}
+            all_updates_flat = {cid: flat for cid, flat in all_updates_flat.items() if cid not in early_reject}
+            all_updates_param_dicts = {cid: pd for cid, pd in all_updates_param_dicts.items() if cid not in early_reject}
+
         # ===============================================================
-        # Stage 2–5: Extended checks
+        # Stage 2–4: Extended checks
         # ===============================================================
 
-        # ---- Stage 1: Subset-Aggregation ----
+        # ---- Stage 2: Subset-Aggregation ----
         flagged_s1, stats_s1 = self.subset_detector.run(client_deltas)
 
-        # ---- Stage 2: Similarity Scan ----
+        # ---- Stage 3: Similarity Scan ----
         scope_ids = flagged_s1 if flagged_s1 else list(client_deltas.keys())
         flagged_s2, stats_s2 = self.sim_detector.run(client_deltas, candidate_ids=scope_ids)
 
-        # ---- Stage 3: Cluster Detection ----
+        # ---- Stage 4: Cluster Detection ----
         sketches = self.sim_detector._make_sketches(client_deltas, flagged_s2)
         clusters, stats_s3 = self.cluster_detector.run(sketches, flagged_s2, round_id)
 
         deep_candidates = [m for c in clusters if c.get("action_reco") == "escalate" for m in c["members"]]
 
-        # ---- Stage 4: Deep Check (Randomized Scheduling) ----
-        deep_results = {}
+        flagged_all = set(flagged_s1) | set(flagged_s2)
+        cluster_rejects = [m for c in clusters if c.get("action_reco") == "reject" for m in c["members"]]
+        mid_reject = list(flagged_all.union(cluster_rejects))
+
+        if mid_reject:
+            log_and_print(f"[SelfCheck] Mid-stage rejecting {len(mid_reject)} clients: {mid_reject}",
+                        log_file=self.log_dir)
+
+            remaining_after_mid = [cid for cid in all_updates_param_dicts.keys() if cid not in mid_reject]
+            log_and_print(
+                f"[SelfCheck] Remaining clients after Stage 2 - 4 (subset/similarity/cluster): "
+                f"{len(remaining_after_mid)} clients -> {remaining_after_mid}",
+                log_file=self.log_dir
+            )
+
+            # Drop them from further stages
+            client_deltas = {cid: delta for cid, delta in client_deltas.items() if cid not in mid_reject}
+            all_updates_param_dicts = {cid: pd for cid, pd in all_updates_param_dicts.items() if cid not in mid_reject}
+
+        mid_stage_info = {
+            "flagged_s1": flagged_s1,
+            "flagged_s2": flagged_s2,
+            "cluster_rejects": cluster_rejects,
+        }
+
+        # ===============================================================
+        # Stage 5: Deep checks
+        # ===============================================================
+
+        # Survivors are clients that passed all prior filters
+        survivors = [
+            cid for cid in all_updates_param_dicts.keys()
+            if cid not in early_reject and cid not in mid_reject
+        ]
 
         # Combine all prior knowledge for scheduler
         deepcheck_clients = self.schedule_deepcheck(
             triage_result=result,
+            mid_stage_info=mid_stage_info,
             escalated_clients=deep_candidates,
-            round_id=round_id
+            round_id=round_id,
+            survivors=survivors,
         )
 
-        # ---- Stage 4: Deep Check (Randomized Scheduling) ----
         if global_model is None and self.global_model is None:
             raise ValueError("[DeepCheckManager] global_model must be provided for sandbox validation.")
 
+        deep_results = {}
         if deepcheck_clients:
             payload_for_deepcheck = {}
 
             # Directly reuse structured dicts prepared earlier
             for cid in deepcheck_clients:
                 if cid not in all_updates_param_dicts:
-                    print(f"[DeepCheck] Warning: missing param_dict for {cid}, skipping.")
+                    log_and_print(f"[DeepCheck] Warning: missing param_dict for {cid}, skipping.", log_file=self.log_dir)
                     continue
 
                 # ensure everything is a float tensor
@@ -427,22 +473,36 @@ class SelfCheckManager:
 
             # Run DeepCheck directly with layer-wise payload
             deep_results = self.deep_check.run_batch(
-                global_model = global_model or self.global_model,
-                client_deltas = payload_for_deepcheck,
-                candidate_clients = deepcheck_clients,
-                client_sigs = client_sigs,
-                ref_sigs = ref_sigs,
-                anchor_loader = anchor_loader or self.anchor_loader
+                global_model=global_model or self.global_model,
+                client_deltas=payload_for_deepcheck,
+                candidate_clients=deepcheck_clients,
+                client_sigs=client_sigs,
+                ref_sigs=ref_sigs,
+                anchor_loader=anchor_loader or self.anchor_loader,
             )
+
         else:
-            deep_results = {}
+            # Print to show case if not any passing previous check to reach deepcheck
+            log_and_print(f"[DeepCheck] Warning: no clients selected for DeepCheck in Round {round_id}", log_file=self.log_dir)
 
         # Combine lightweight + deep results into final per-client decisions
         decisions, trust_scores, public_out = self._decide_clients(
             triage_result=result,
+            mid_stage_info=mid_stage_info,
             deep_results=deep_results,
-            client_meta=None  # you can pass validation stats here if available
+            client_meta=None
         )
+
+        # Combine all rejection phases
+        all_rejects = set(early_reject) | set(mid_reject)
+        final_rejects = {cid for cid, d in decisions.items() if d == "REJECT"}
+        total_rejects = list(all_rejects | final_rejects)
+
+        # Include total accepted (those not in rejects)
+        accepted_total = [
+            cid for cid in decisions.keys()
+            if cid not in total_rejects and decisions[cid] == "ACCEPT"
+        ]
 
         # Update result dict (internal / local use only)
         result.update({
@@ -461,32 +521,45 @@ class SelfCheckManager:
             safe_log = {
                 "round": round_id,
                 "counts": {
-                    "accepted": sum(1 for d in decisions.values() if d == "ACCEPT"),
+                    "accepted_stage_final": len(accepted_total),
+                    "rejected_stage1": len(early_reject),
+                    "rejected_stage23": len(mid_reject),
+                    "rejected_stage4": len(final_rejects),
+                    "rejected_total": len(total_rejects),
                     "downweighted": sum(1 for d in decisions.values() if d == "DOWNWEIGHT"),
                     "hold": sum(1 for d in decisions.values() if d == "HOLD"),
-                    "rejected": sum(1 for d in decisions.values() if d == "REJECT"),
                 },
                 "trust_summary": public_out.get("trust_summary", {}),
-                # Include high-level anomaly and escalation stats
                 "anomaly_rate": float(self.last_anomaly_rate),
-                "num_flagged": sum(1 for d in decisions.values() if d == "REJECT"),
-                "num_downweighted": sum(1 for d in decisions.values() if d == "DOWNWEIGHT"),
-                "num_hold": sum(1 for d in decisions.values() if d == "HOLD"),
-                "num_total": len(decisions),
+                "num_flagged": len(total_rejects),
+                "num_total": len(decisions) + len(early_reject) + len(mid_reject),
+                "reject_clients": list(total_rejects),
+                "accepted_clients": accepted_total,
             }
 
-            log_path = SH_LOG_DIR / "selfcheck_public_summary.json"
+            log_path = SH_LOG_DIR / "selfcheck_public_summary.jsonl"
             with open(log_path, "a") as f:
                 f.write(json.dumps(safe_log) + "\n")
 
         except Exception as e:
-            print(f"[SelfCheckManager] Warning: failed to log public summary — {e}")
+            log_and_print(f"[SelfCheckManager] Warning: failed to log public summary — {e}", log_file=self.log_dir)
 
-        print(f"[Round {round_id}] Completed all checks | "
+        log_and_print(f"[Round {round_id}] Completed all checks | "
                 f"DeepCheck clients={len(deepcheck_clients)} | "
                 f"Anomaly rate={self.last_anomaly_rate:.2%} | "
                 f"Accepted={public_out['counts'].get('accepted', 0)} | "
-                f"Rejected={public_out['counts'].get('rejected', 0)}")
+                f"Rejected={public_out['counts'].get('rejected', 0)}",
+                log_file=self.log_dir)
+
+        total_clients = len(client_updates)
+        log_and_print(
+            f"[Round {round_id}] Final accept list ({len(accepted_total)}/{total_clients}): {accepted_total}",
+            log_file=self.log_dir
+        )
+        log_and_print(
+            f"[Round {round_id}] Final reject list ({len(total_rejects)}/{total_clients}): {total_rejects}",
+            log_file=self.log_dir
+        )
 
         # Return privacy-preserving output (server-safe)
         return public_out
@@ -500,46 +573,100 @@ class SelfCheckManager:
         diffs = [abs(raw_value - b) for b in bins]
         return bins[int(np.argmin(diffs))]
 
-    def _decide_clients(self, triage_result: Dict[str, Any], deep_results: Dict[str, Any], client_meta: Optional[Dict[str, Any]] = None):
+    def _decide_clients(
+        self,
+        triage_result: Dict[str, Any],
+        mid_stage_info: Optional[Dict[str, Any]] = None,
+        deep_results: Optional[Dict[str, Any]] = None,
+        client_meta: Optional[Dict[str, Any]] = None,
+    ):
         """
         Compose a final decision for each client using:
-         - triage_result (must include 'flags' and ideally 'anomaly_scores')
-         - deep_results (detailed per-client deep check outcomes; may be empty)
-         - client_meta (optional, e.g. reported validation loss)
+            - triage_result (must include 'flags' and ideally 'anomaly_scores')
+            - mid_stage_info (subset/similarity/cluster flags)
+            - deep_results (detailed per-client deep check outcomes; may be empty)
+            - client_meta (optional, e.g. reported validation loss)
         Returns:
-         - decisions: dict client_id -> "ACCEPT"|"DOWNWEIGHT"|"HOLD"|"REJECT"
-         - trust_scores: dict client_id -> float|None (None => HOLD / run deeper)
-         - public_out: privacy-preserving structure to return to server
+            - decisions: dict client_id -> "ACCEPT"|"DOWNWEIGHT"|"HOLD"|"REJECT"
+            - trust_scores: dict client_id -> float|None (None => HOLD / run deeper)
+            - public_out: privacy-preserving structure to return to server
         """
+
+        # === Gather inputs ===
         flags = triage_result.get("flags", {})
         if not flags:
             flags = {cid: False for cid in triage_result.get("features", {}).keys()}
-        anomaly_scores = triage_result.get("anomaly_scores", {})  # may be present or empty
-        client_meta = client_meta or {}
 
+        anomaly_scores = triage_result.get("anomaly_scores", {})
+        client_meta = client_meta or {}
+        deep_results = deep_results or {}
+        mid_stage_info = mid_stage_info or {}
+
+        subset_flags = set(mid_stage_info.get("flagged_s1", []))
+        similar_flags = set(mid_stage_info.get("flagged_s2", []))
+        cluster_rejects = set(mid_stage_info.get("cluster_rejects", []))
+
+        # --- Start from triage decisions if available ---
         decisions = {}
+        if isinstance(triage_result, dict) and "decisions" in triage_result:
+            for cid, tri_dec in triage_result["decisions"].items():
+                decisions[cid] = tri_dec
+
+        for cid in flags.keys():
+            if cid not in decisions:
+                decisions[cid] = None
+
         trust_scores = {}
 
-        # --- base decision from triage/anomaly ---
+        # === Normalize deep_results (handle summary or per-client) ===
+        deep_accepts = set()
+        deep_rejects = set()
+
+        if isinstance(deep_results, dict):
+            for cid, info in deep_results.items():
+                if not isinstance(info, dict):
+                    continue
+                action = info.get("action")
+                if action == "accept":
+                    deep_accepts.add(cid)
+                elif action == "reject":
+                    deep_rejects.add(cid)
+
+            if "accepted" in deep_results and isinstance(deep_results["accepted"], list):
+                deep_accepts.update(deep_results["accepted"])
+            if "rejected" in deep_results and isinstance(deep_results["rejected"], list):
+                deep_rejects.update(deep_results["rejected"])
+
+        # === Decision logic per client ===
         for cid in flags.keys():
             a_score = float(anomaly_scores.get(cid, 0.0))
-            # escalate if deep_results explicitly mark REJECT or ACCEPT
-            deep_info = deep_results.get(cid, {}) if isinstance(deep_results, dict) else {}
-            deep_action = deep_info.get("action")  # e.g., "reject","accept","downweight", or None
 
-            if deep_action == "reject":
+            # --- mid-stage influence (soft penalties) ---
+            if cid in subset_flags:
+                a_score += 0.05
+            if cid in similar_flags:
+                a_score += 0.05
+            if cid in cluster_rejects:
+                a_score += 0.10
+            a_score = min(a_score, 1.0)
+
+            # --- Deep check override (highest priority) ---
+            if cid in deep_rejects:
                 dec = "REJECT"
                 trust = 0.0
-            elif deep_action == "accept":
+                deep_action = "reject"
+            elif cid in deep_accepts:
                 dec = "ACCEPT"
                 trust = 1.0
+                deep_action = "accept"
             else:
-                # default rule-based mapping (tunable)
+                deep_action = None
+                # --- Rule-based mapping ---
                 if a_score >= self.threshold_high:
                     dec = "REJECT"
                     trust = 0.0
                 elif a_score >= self.threshold_mid:
-                    dec = "HOLD"    # run deeper check / delay decision
+                    dec = "HOLD"
                     trust = None
                 elif a_score >= self.threshold_low:
                     dec = "DOWNWEIGHT"
@@ -548,45 +675,78 @@ class SelfCheckManager:
                     dec = "ACCEPT"
                     trust = 1.0
 
-            # incorporate simple validation-loss escalation if provided
+            # --- Optional validation-loss escalation ---
             meta = client_meta.get(cid, {})
             client_val = meta.get("val_loss")
             global_val = meta.get("global_val_loss")
             if (client_val is not None) and (global_val is not None):
-                # if client validation loss is much worse, escalate
-                if client_val > global_val + 0.02:  # config tweakable
+                if client_val > global_val + 0.02:
                     dec = "REJECT"
                     trust = 0.0
+
+            # --- Penalty for multiple flags ---
+            flag_count = sum([
+                cid in subset_flags,
+                cid in similar_flags,
+                cid in cluster_rejects
+            ])
+            if flag_count >= 2 and dec != "REJECT":
+                dec = "DOWNWEIGHT"
+                trust = 0.4
 
             decisions[cid] = dec
             trust_scores[cid] = trust
 
-        # --- make the public (privacy-preserving) output ---
-        # Option A: If return_only_mask: return accepted clients list & counts
+            log_and_print(
+                f"[Decision] {cid}: a_score={a_score:.3f} | "
+                f"subset={cid in subset_flags} | similar={cid in similar_flags} | "
+                f"cluster={cid in cluster_rejects} | deep_action={deep_action} | "
+                f"final={dec} | trust={trust}",
+                log_file=self.log_dir,
+            )
+
+        # --- Enforce deep check rejections once more (defensive) ---
+        for cid in deep_rejects:
+            decisions[cid] = "REJECT"
+            trust_scores[cid] = 0.0
+            log_and_print(f"[Decision][ENFORCE] {cid} forced REJECT by deep_check", log_file=self.log_dir)
+
+        # === Build public output ===
         if self.return_only_mask:
             accepted = [cid for cid, d in decisions.items() if d == "ACCEPT"]
             downweighted = [cid for cid, d in decisions.items() if d == "DOWNWEIGHT"]
             rejected = [cid for cid, d in decisions.items() if d == "REJECT"]
             hold = [cid for cid, d in decisions.items() if d == "HOLD"]
+
             public_out = {
                 "accepted": accepted,
                 "downweighted": downweighted,
                 "rejected": rejected,
                 "hold": hold,
-                "counts": {"accepted": len(accepted), "downweighted": len(downweighted), "rejected": len(rejected), "hold": len(hold)}
+                "counts": {
+                    "accepted": len(accepted),
+                    "downweighted": len(downweighted),
+                    "rejected": len(rejected),
+                    "hold": len(hold),
+                },
             }
         else:
-            # Option B: Return quantized trust scores (no raw anomaly values),
-            # and optionally aggregate-level summary (mean/std).
             q_trust = {cid: self._quantize_trust(trust_scores[cid]) for cid in trust_scores.keys()}
             trust_vals = [v for v in q_trust.values() if v is not None]
             public_out = {
                 "trust_scores_quantized": q_trust,
-                "trust_summary": {"mean": float(np.mean(trust_vals)) if trust_vals else None, "std": float(np.std(trust_vals)) if trust_vals else None},
-                "counts": {k: sum(1 for v in q_trust.values() if v == k) for k in sorted(self.trust_bins)}
+                "trust_summary": {
+                    "mean": float(np.mean(trust_vals)) if trust_vals else None,
+                    "std": float(np.std(trust_vals)) if trust_vals else None,
+                },
+                "counts": {
+                    "accepted": sum(1 for v in q_trust.values() if v == 1.0),
+                    "downweighted": sum(1 for v in q_trust.values() if v == 0.5),
+                    "rejected": sum(1 for v in q_trust.values() if v == 0.0),
+                    "hold": sum(1 for v in q_trust.values() if v is None),
+                },
             }
 
-        # optionally include anomaly_scores only if explicitly allowed
         if self.expose_anomaly_scores:
             public_out["anomaly_scores"] = anomaly_scores
 

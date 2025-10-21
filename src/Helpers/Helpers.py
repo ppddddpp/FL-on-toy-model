@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 import re
+import json
+import warnings
 
 def kg_alignment_loss(joint_emb, batch_ids, kg_embs, node2id, trainer,
                       labels=None, label_cols=None, loss_type="cosine"):
@@ -76,7 +78,7 @@ def log_and_print(*msgs, log_file=None):
 
     Args:
         *msgs: The messages to print and log.
-        log_file: The path to the log file. Must be provided.
+        log_file: The path to the log file. Skip log if log file path is none
 
     Raises:
         ValueError: If log_file is None.
@@ -85,7 +87,8 @@ def log_and_print(*msgs, log_file=None):
     print(text)
     
     if log_file is None:
-        raise ValueError("log_file must be provided")
+        warnings.warn("Log file is None skip saving log to file")
+        return
     
     log_file = Path(log_file)
     if not log_file.parent.exists():
@@ -93,3 +96,19 @@ def log_and_print(*msgs, log_file=None):
     
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(text + "\n")
+
+def log_round_summary(summary, log_dir="logs"):
+    """
+    Logs the given round summary as a JSON object to a file in the given log directory.
+
+    Args:
+        summary (dict): The round summary to log.
+        log_dir (str, optional): The directory to log to. Defaults to "logs".
+    """
+    if not Path(log_dir).exists():
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+    log_path = Path(log_dir) / "round_summary.jsonl"
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary) + "\n")

@@ -4,8 +4,6 @@ from typing import Dict, Any, Optional
 import numpy as np
 import secrets
 import hashlib
-import time
-
 
 class SignatureEvaluator:
     """
@@ -13,10 +11,10 @@ class SignatureEvaluator:
     and a reference signature — with optional hardening features.
     
     Supports:
-      - Salted signature randomization per round
-      - Projection seed rotation
-      - Differential privacy (DP) noise
-      - Rolling normalization for adaptive scoring
+        - Salted signature randomization per round
+        - Projection seed rotation
+        - Differential privacy (DP) noise
+        - Rolling normalization for adaptive scoring
     """
 
     def __init__(
