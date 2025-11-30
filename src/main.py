@@ -72,7 +72,7 @@ else:
 # =========================================================
 client_paths = [
     BASE_DIR / "data" / "animal" / f"n{i}" / f"client_{i}_data.csv"
-    for i in range(1, 11)
+    for i in range(1, 4)
 ]
 
 clients = []

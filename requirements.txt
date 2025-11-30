@@ -10,3 +10,6 @@ scikit-learn==1.7.0
 python-dotenv==0.9
 wandb==0.21.0
 rdflib==7.2.1
+sentence-transformers==2.5.2
+cleanlab==2.7.1
+stasticsmodels==0.14.5
