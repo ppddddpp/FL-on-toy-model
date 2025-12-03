@@ -18,7 +18,7 @@ class MaliciousContributionsGeneratorOnGradient:
             Random seed for reproducibility.
     """
 
-    def __init__(self, attack_type='label_flip', scale_factor=10.0, seed=2709):
+    def __init__(self, attack_type='label_flip', scale_factor=10.0, seed=2709, history_window=5):
         """
         Parameters
         ----------
@@ -35,6 +35,7 @@ class MaliciousContributionsGeneratorOnGradient:
         self.attack_type = attack_type
         self.scale_factor = scale_factor
         self.rng = np.random.default_rng(seed)
+        self.history_window = history_window
 
     def generate(self, benign_update, **kwargs):
         """
@@ -263,32 +264,3 @@ class MaliciousContributionsGeneratorOnGradient:
         elif prev_updates is None or len(prev_updates) == 0:
             print("Adaptive attack requires 'prev_updates'; running as benign for this round.")
         return malicious
-
-# Example usage
-if __name__ == '__main__':
-    # Simulate a simple benign update
-    benign_update = {
-        'layer1': np.array([0.1, -0.2]),
-        'layer2': np.array([[0.05, -0.05], [0.02, 0.03]])
-    }
-    
-    print("--- Benign Update ---")
-    print(benign_update)
-    print("---------------------\n")
-    
-    # Example 1: Sign Flip Attack
-    mc_grad_sign_flip = MaliciousContributionsGeneratorOnGradient(attack_type='sign_flip', scale_factor=5.0)
-    malicious_update_sf = mc_grad_sign_flip.generate(benign_update)
-    print("--- Sign Flip Attack (scale=5.0) ---")
-    print(malicious_update_sf)
-    
-    # Example 2: Norm Clip Evasion Attack
-    clip_threshold_val = 0.5
-    mc_grad_clip_evasion = MaliciousContributionsGeneratorOnGradient(attack_type='norm_clip_evasion', scale_factor=1.0)
-    malicious_update_nce = mc_grad_clip_evasion.generate(benign_update, clip_threshold=clip_threshold_val)
-    print("\n--- Norm Clip Evasion Attack (target norm < {}) ---".format(clip_threshold_val))
-    print(malicious_update_nce)
-
-    # Verify the norm for the evasion attack (should be just under 0.5)
-    total_norm = np.sqrt(sum(np.sum(v**2) for v in malicious_update_nce.values()))
-    print(f"Malicious Update Norm: {total_norm:.6f}")

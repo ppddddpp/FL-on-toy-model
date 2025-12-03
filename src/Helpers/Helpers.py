@@ -4,6 +4,11 @@ from pathlib import Path
 import re
 import json
 import warnings
+import numpy as np
+from typing import Dict
+import pandas as pd
+
+from DataHandler.dataloader import ToyTextDataset
 
 def kg_alignment_loss(joint_emb, batch_ids, kg_embs, node2id, trainer,
                       labels=None, label_cols=None, loss_type="cosine"):
@@ -112,3 +117,48 @@ def log_round_summary(summary, log_dir="logs"):
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(summary) + "\n")
+
+def _device_from_state_dict(sd):
+    for v in sd.values():
+        if isinstance(v, torch.Tensor):
+            return v.device
+    return torch.device("cpu")
+
+def torch_delta_to_numpy(delta_torch: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+    out = {}
+    for k, v in delta_torch.items():
+        try:
+            out[k] = v.detach().cpu().numpy().copy()
+        except Exception:
+            out[k] = np.array(v).copy()
+    return out
+
+def numpy_delta_to_torch(delta_numpy: Dict[str, np.ndarray], device, ref_state_dict) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, arr in delta_numpy.items():
+        ref = ref_state_dict[k]
+        t = torch.from_numpy(np.array(arr)).to(device=device, dtype=ref.dtype)
+        if t.shape != ref.shape:
+            try:
+                t = t.reshape(ref.shape)
+            except Exception:
+                t = torch.zeros_like(ref)
+        out[k] = t
+    return out
+
+def toy_dataset_to_df(ds):
+    """Convert ToyTextDataset --> DataFrame(text, label)."""
+    return pd.DataFrame({
+        "text": ds.texts,
+        "label": ds.labels
+    })
+
+def df_to_toy_dataset(df, original_ds):
+    """Convert DataFrame --> ToyTextDataset (same vocab, max_len, classes)."""
+    return ToyTextDataset(
+        texts=df["text"].tolist(),
+        labels=df["label"].tolist(),
+        vocab=original_ds.vocab,
+        max_len=original_ds.max_len,
+        num_classes=original_ds.num_classes
+    )

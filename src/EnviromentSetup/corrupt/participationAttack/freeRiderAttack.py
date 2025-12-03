@@ -4,47 +4,35 @@ import pandas as pd
 
 class FreeRiderAttack:
     """
-    Simulates free-rider clients in FL.
-    These clients contribute minimal or no computation or data,
-    but still want to obtain the global model.
+    Gradient-side free-rider behavior.
+    Works AFTER MC-Grad and should never pollute MC-Grad history.
     """
 
-    def __init__(self, mode="zero", fake_data_size=0, noise_scale=0.001, seed=123):
-        """
-        mode:
-            - 'zero'        → sends zero gradients
-            - 'weak'        → sends very small gradients
-            - 'cached'      → reuses previous gradient
-            - 'no_data'     → trains on no data (empty dataset)
-        """
+    def __init__(self, mode="zero", fake_data_size=None, noise_scale=0.001, seed=123):
         self.mode = mode
         self.fake_data_size = fake_data_size
         self.noise_scale = noise_scale
         self.rng = np.random.default_rng(seed)
-        self.cached_gradient = None  # used in 'cached' mode
+        self.cached_gradient = None
 
     def apply(self, benign_update, client_metadata=None):
         """
         Parameters
         ----------
-        benign_update : dict
-            Real gradient update
-        client_metadata : dict
-            Should contain 'num_samples' if available
-        
-        Returns
-        -------
-        malicious_update : dict
-        updated_metadata : dict
+        benign_update: dict of numpy arrays (ALREADY ATTACKED by MC-Grad)
+        client_metadata: dict with num_samples
+
+        Returns malicious_update, updated_metadata
         """
-        update = copy.deepcopy(benign_update)
-        metadata = client_metadata.copy() if client_metadata else {}
 
-        # Fake data contribution
+        update = {k: v.copy() for k, v in benign_update.items()}
+        metadata = (client_metadata or {}).copy()
+
+        # override dataset size (lie)
         if self.fake_data_size is not None:
-            metadata['num_samples'] = self.fake_data_size
+            metadata["num_samples"] = self.fake_data_size
 
-        # --- Modes ---
+        # modes
         if self.mode == "zero":
             for k in update:
                 update[k] = np.zeros_like(update[k])
@@ -54,22 +42,25 @@ class FreeRiderAttack:
                 update[k] = update[k] * self.noise_scale
 
         elif self.mode == "cached":
-            # First call: store benign for future reuse
             if self.cached_gradient is None:
-                self.cached_gradient = copy.deepcopy(update)
+                # store clean copy for next time
+                self.cached_gradient = {k: v.copy() for k, v in update.items()}
             else:
-                update = copy.deepcopy(self.cached_gradient)
+                # reuse previous gradient
+                update = {k: v.copy() for k, v in self.cached_gradient.items()}
 
         elif self.mode == "no_data":
-            # Equivalent to zero or tiny noisy update
             for k in update:
-                update[k] = self.rng.normal(0, self.noise_scale, size=update[k].shape)
+                update[k] = self.rng.normal(
+                    loc=0.0,
+                    scale=self.noise_scale,
+                    size=update[k].shape
+                )
 
         else:
             raise ValueError(f"Unknown FreeRiderAttack mode: {self.mode}")
 
         return update, metadata
-    
 
 class FreeRiderDataAttack:
     """
@@ -116,6 +107,7 @@ class FreeRiderDataAttack:
         self.duplicate_factor = duplicate_factor
         self.fake_data_size = fake_data_size
         self.random_noise_dim = random_noise_dim
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
 
     def apply(self, dataset, metadata=None):
@@ -175,3 +167,33 @@ class FreeRiderDataAttack:
             metadata["num_samples"] = len(malicious_data)
 
         return malicious_data, metadata
+    
+    def _generate_random_dataset(self, dataset):
+        """
+        Generate a random (non-informative) dataset matching the input dataset.
+        
+        Parameters
+        ----------
+        dataset : pandas.DataFrame or list/np.array
+            The original dataset to mimic shape.
+        
+        Returns
+        -------
+        malicious_dataset : pandas.DataFrame or np.array
+            Random dataset of the same shape as input.
+        """
+        length = len(dataset)
+
+        if isinstance(dataset, pd.DataFrame):
+            data = {}
+            for col in dataset.columns:
+                if pd.api.types.is_numeric_dtype(dataset[col]):
+                    data[col] = self.rng.normal(0, 1, size=length)
+                else:
+                    data[col] = [f"rand_{self.rng.integers(1e9)}" for _ in range(length)]
+            return pd.DataFrame(data)
+
+        else:
+            dim = self.random_noise_dim or 32  # default dim if list/array
+            return self.rng.normal(0, 1, size=(length, dim))
+

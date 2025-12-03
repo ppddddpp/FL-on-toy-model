@@ -15,23 +15,15 @@ class Client:
         kg_dir=None,
         use_kg_align=True
     ):
-        """
-        Args:
-            client_id (str): client identifier
-            model_fn (callable): returns a new model instance
-            dataset (Dataset): local dataset
-            device (str): "cpu" or "cuda"
-            kg_dir (str or Path, optional): path to KG embedding directory
-            use_kg_align (bool): whether to use semantic KG alignment
-        """
         self.client_id = client_id
         self.model_fn = model_fn
         self.dataset = dataset
         self.device = device
         self.kg_dir = kg_dir
         self.use_kg_align = use_kg_align and kg_dir is not None
+        self.mc_grad_engine = None
 
-        # preload KG if available
+        # preload KG if exists
         if self.use_kg_align and os.path.exists(os.path.join(kg_dir, "node_embeddings_best.npy")):
             self.kg_embs = torch.tensor(
                 np.load(os.path.join(kg_dir, "node_embeddings_best.npy")),
@@ -46,7 +38,7 @@ class Client:
             if kg_dir:
                 print(f"[{client_id}] KG directory found but embeddings missing — skipping alignment")
 
-    # ---------- helper for safe model loading ----------
+    # ---------- safe load ----------
     @staticmethod
     def _load_state_safely(model, global_weights):
         model_dict = model.state_dict()
@@ -55,72 +47,55 @@ class Client:
             if k in model_dict and model_dict[k].shape == v.shape:
                 filtered[k] = v
             else:
-                print(f"[Warning] Skipped weight '{k}' due to shape mismatch: "
-                      f"{v.shape} vs {model_dict.get(k, torch.empty(0)).shape}")
+                print(f"[Warning] Skipped weight '{k}' due to shape mismatch.")
         model_dict.update(filtered)
         model.load_state_dict(model_dict)
         return model
 
-    # ---------- optional semantic alignment ----------
+    # ---------- KG alignment ----------
     def _align_classifier_with_kg(self, model):
         if self.kg_embs is None:
             return model
 
-        # use a local name so assignments below don't make kg_embs a local before this check
         kg_embs = self.kg_embs
 
-        # find a classifier linear layer (try classifier attr first, then fallback)
         classifier = None
-        # prefer an explicit classifier attribute if present
         if hasattr(model, "classifier"):
-            # attempt to find the final linear layer inside model.classifier
             for m in reversed(list(model.classifier.modules())):
                 if isinstance(m, nn.Linear):
                     classifier = m
                     break
-
-        # fallback to scanning named_modules
         if classifier is None:
             for name, module in model.named_modules():
                 if isinstance(module, nn.Linear):
                     classifier = module
                     break
-
         if classifier is None:
             return model
 
-        # determine target dim (prefer token_embeddings if available)
         target_dim = getattr(getattr(model, "token_embeddings", None), "embedding_dim", None)
         if target_dim is None:
-            # fallback to classifier hidden dim (weight shape: [num_labels, hidden_dim])
             target_dim = classifier.weight.shape[1]
 
-        # project KG embeddings if their dim != model embedding dim
         if kg_embs.size(1) != target_dim:
-            print(f"[Client] Projecting KG embeddings from {kg_embs.size(1)} -> {target_dim}")
+            print(f"[Client] Projecting KG embeddings {kg_embs.size(1)}→{target_dim}")
             proj = torch.nn.Linear(kg_embs.size(1), target_dim, bias=False).to(kg_embs.device)
             with torch.no_grad():
                 kg_embs = proj(kg_embs)
 
         with torch.no_grad():
-            W = classifier.weight  # [num_labels, hidden_dim]
-            # cosine sim between label embeddings and KG embeddings
+            W = classifier.weight
             sim = torch.nn.functional.cosine_similarity(
                 W.unsqueeze(1), kg_embs.unsqueeze(0), dim=-1
-            )  # -> [num_labels, num_kg_nodes]
-            aligned = torch.matmul(sim, kg_embs)  # -> [num_labels, target_dim]
-            # ensure shape matches the classifier weight exactly
+            )
+            aligned = torch.matmul(sim, kg_embs)
             if aligned.shape == classifier.weight.shape:
                 classifier.weight.copy_(aligned)
-            else:
-                print("[Client] Warning: aligned shape mismatch, skipping weight copy:",
-                    aligned.shape, classifier.weight.shape)
 
-        print(f"[{self.client_id}] Classifier semantically aligned with KG embeddings")
+        print(f"[{self.client_id}] Classifier aligned with KG embeddings")
         return model
 
-
-    # ---------- main training ----------
+    # ---------- LOCAL TRAIN ----------
     def local_train(
         self,
         global_weights,
@@ -131,9 +106,9 @@ class Client:
         log_interval=10
     ):
         model = self.model_fn().to(self.device)
-        model = self._load_state_safely(model, global_weights)  # Option B
+        model = self._load_state_safely(model, global_weights)
         if self.use_kg_align:
-            model = self._align_classifier_with_kg(model)        # Option C
+            model = self._align_classifier_with_kg(model)
 
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -148,6 +123,14 @@ class Client:
                 logits = model(ids, attention_mask=mask)
                 loss = criterion(logits, y)
                 loss.backward()
+
+                if self.mc_grad_engine is not None:
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            grad_np = param.grad.detach().cpu().numpy()
+                            attacked = self.mc_grad_engine.generate({name: grad_np})[name]
+                            param.grad = torch.from_numpy(attacked).to(param.device)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
 
@@ -155,6 +138,7 @@ class Client:
                     print(f"[{self.client_id}] Epoch {epoch+1} "
                           f"Batch {batch_idx+1}/{len(loader)} Loss: {loss.item():.4f}")
 
+        # save
         if save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
@@ -178,6 +162,7 @@ class Client:
                 preds = logits.argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
+
         acc = correct / total if total > 0 else 0.0
         print(f"[{self.client_id}] Evaluation Accuracy: {acc:.4f}")
         return acc

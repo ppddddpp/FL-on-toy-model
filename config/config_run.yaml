@@ -1,0 +1,79 @@
+# ------------------------------------------------------------
+# Experiment selection
+# ------------------------------------------------------------
+# Choose exactly ONE:
+#   - MC_DATA
+#   - MC_GRAD
+#   - MC_BOTH
+#   - FR_DATA
+#   - FR_GRAD
+#   - FR_BOTH
+#   - SYBIL_ONLY
+experiment_case: "MC_GRAD"
+
+# ------------------------------------------------------------
+# Attackers
+# ------------------------------------------------------------
+attacker_ids:
+  - "client_2"
+
+# ------------------------------------------------------------
+# FL Runtime Config
+# ------------------------------------------------------------
+num_rounds: 5
+local_epochs: 3
+seed: 2709
+
+
+# ============================================================
+# Attack options
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Malicious Contribution — Data Attacks
+# ------------------------------------------------------------
+mc_data_attack_type: "random_label_flip"   # random_label_flip | targeted_label_flip | backdoor
+text_col: "Information"
+label_col: "Group"
+client_col: "Group"
+src_label: "Amphibians"                   # used for targeted_label_flip
+tgt_label: "Mammals"                # used for targeted_label_flip
+suspect_fraction: 0.10
+
+# ------------------------------------------------------------
+# Malicious Contribution — Gradient Attacks
+# ------------------------------------------------------------
+mc_grad_attack_type: "sign_flip"    # sign_flip | random_label_flip
+mc_grad_scale_factor: 10.0
+mc_grad_history_window: 5
+
+# ------------------------------------------------------------
+# Free-Riders Data Attacks
+# ------------------------------------------------------------
+free_rider_mode: "tiny"      # empty | tiny | duplicate | random
+tiny_fraction: 0.02
+duplicate_factor: 20
+fake_data_size_data: 4
+mc_grad_train: false     # apply inside training loop
+mc_grad_delta: true      # apply on final delta
+
+
+# ------------------------------------------------------------
+# Free-Riders Gradient Attacks
+# ------------------------------------------------------------
+free_rider_grad_mode: "weak"    # weak | strong
+fake_data_size_grad: 2
+noise_scale: 0.001
+
+# ------------------------------------------------------------
+# Sybil Attack
+# ------------------------------------------------------------
+sybil_mode: "static"        # static | leader | coordinated
+alpha: 0.8                  # smoothing factor (for coordinated mode)
+sybil_collusion: true
+sybil_fake_data_size: 400
+sybil_history_window: 5
+sybil_amplification_factor: 1.0
+# ============================================================
+
