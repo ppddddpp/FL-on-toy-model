@@ -54,7 +54,8 @@ class AnchorEvaluator:
 
         self.anchor_loader = anchor_loader
         self.device = device
-        self.running_std = float(running_std)
+        self.running_std = float(running_std) if running_std is not None else 0.05
+        self._empirical_std = None
         self.kappa = float(kappa)
         self.use_original = bool(use_original)
         self.eps = float(eps)
@@ -101,12 +102,79 @@ class AnchorEvaluator:
         return x if x > 20 else math.log1p(math.exp(x))
 
     def _compute_L_anchor(self, acc_g: float, acc_p: float) -> float:
+        """
+        Compute the anchor loss metric L_anchor robustly.
+
+        Uses an adaptive sigma:
+        sigma = max(configured_running_std, observed_std_from_rolling, empirical_calibrated_std, eps)
+        so that tiny configured values do not blow up the z-score.
+        """
         if self.use_original:
             delta = acc_p - acc_g
             return float(max(0.0, -delta))
-        sigma = max(self.running_std, self.eps)
+
+        # observed std from recent L_anchor values (if available)
+        observed = 0.0
+        try:
+            arr = np.asarray(self._rolling_L, dtype=float)
+            if arr.size > 1:
+                observed = float(np.std(arr, ddof=1))
+        except Exception:
+            observed = 0.0
+
+        # take whichever is larger: configured, observed, or an empirical calibrated value
+        cand = [self.running_std if self.running_std is not None else 0.0,
+                observed if observed is not None else 0.0,
+                self._empirical_std if self._empirical_std is not None else 0.0,
+                self.eps]
+        sigma = max(cand)
+
+        # avoid zero sigma
+        sigma = max(float(sigma), float(self.eps))
+
         z = (acc_g - acc_p) / sigma
         return float(self._softplus(z * self.kappa))
+
+    def calibrate_running_std(self, global_model: nn.Module, n_trials: int = 8, noise_scale: float = 1e-3, device: Optional[torch.device] = None):
+        """
+        Empirically estimate typical anchor accuracy variation by applying small random perturbations
+        to the model and measuring anchor accuracy across trials.
+
+        Call this once after baseline is ready (server side). It sets self._empirical_std.
+        """
+        if self.anchor_loader is None:
+            self.logger.warning("AnchorEvaluator.calibrate_running_std: no anchor_loader available")
+            return
+
+        dev = device
+        try:
+            if dev is None:
+                dev = next(global_model.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
+
+        base_acc = self._evaluate_accuracy(global_model, self.anchor_loader, dev)
+        accs = []
+        for t in range(n_trials):
+            # create a small noisy clone
+            clone = self._clone_model(global_model).to(dev)
+            with torch.no_grad():
+                for name, p in clone.named_parameters():
+                    if p.requires_grad:
+                        noise = torch.randn_like(p) * noise_scale
+                        p.add_(noise)
+            acc = self._evaluate_accuracy(clone, self.anchor_loader, dev)
+            accs.append(acc)
+
+        if len(accs) > 1:
+            emp_std = float(np.std(accs, ddof=1))
+        else:
+            emp_std = float(0.0)
+
+        # set empirical std but keep it reasonable (floor)
+        emp_std = max(emp_std, self.eps)
+        self._empirical_std = emp_std
+        self.logger.info(f"[AnchorEvaluator] Calibrated empirical running_std={self._empirical_std:.6f} (base_acc={base_acc:.4f})")
 
     def _safe_apply_delta(self, state_dict, client_delta, device):
         """Apply additive delta but only for matching keys/shapes. Returns warnings list."""
@@ -310,23 +378,30 @@ class AnchorEvaluator:
                     self.logger.warning(f"bn_calibration failed client={client_id}: {e}")
 
                 acc_p = self._evaluate_accuracy(model_clone, self.anchor_loader, device)
-                L_anchor = self._compute_L_anchor(acc_g, acc_p)
+
+                # after acc_p computed
                 delta_acc = acc_p - acc_g
-
-                # record for adaptive L_max
+                L_anchor = self._compute_L_anchor(acc_g, acc_p)
+                # compute sigma for logging (duplicate logic or expose sigma from _compute_L_anchor if you prefer)
+                try:
+                    arr = np.asarray(self._rolling_L, dtype=float)
+                    observed = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+                except Exception:
+                    observed = 0.0
+                sigma_used = max(self.running_std if self.running_std is not None else 0.0,
+                                observed,
+                                self._empirical_std if self._empirical_std is not None else 0.0,
+                                self.eps)
                 self._record_L(L_anchor)
-
-                # normalized score
                 S_anchor = self.get_normalized_score(L_anchor)
-
-                # structured log
                 self.logger.info({
                     "client_id": client_id,
                     "acc_g": float(acc_g),
                     "acc_p": float(acc_p),
                     "L_anchor": float(L_anchor),
                     "S_anchor": float(S_anchor),
-                    "delta_acc": float(delta_acc),
+                    "delta_acc": float(acc_p - acc_g),
+                    "sigma_used": float(sigma_used),
                     "warnings": warnings
                 })
 

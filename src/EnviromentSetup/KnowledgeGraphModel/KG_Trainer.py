@@ -16,7 +16,7 @@ from .compgcn_conv import CompGCNConv
 import wandb
 from tqdm import tqdm
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parents[3]
 KG_DIR = BASE_DIR / "knowledge_graph"
 KG_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -9,7 +9,7 @@
 #   - FR_GRAD
 #   - FR_BOTH
 #   - SYBIL_ONLY
-experiment_case: "MC_GRAD"
+experiment_case: "MC_DATA"
 
 # ------------------------------------------------------------
 # Attackers

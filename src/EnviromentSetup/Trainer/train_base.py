@@ -28,11 +28,11 @@ class BaseTrainer:
         batch_size: int = 32,
         lr: float = 1e-4,
         device: str = None,
-        kg_dir: str = "knowledge_graph",
-        ttl_path: str = BASE_DIR / "data" / "medical_data" / "base" / "human_body_knowledge_graph.ttl",
+        kg_dir: str = None,
+        ttl_path: str = BASE_DIR / "data" / "animal" / "base" / "animal_kg.cleaned.ttl",
         save_dir: str = "checkpoints/base_model",
         cfg=None,
-        use_wandb: bool = True
+        use_wandb: bool = False
     ):
         # --- Load config ---
         cfg = Config.load(os.path.join(BASE_DIR, "config", "config.yaml")) if cfg is None else cfg
@@ -42,7 +42,7 @@ class BaseTrainer:
         if train_dataset is None:
             print("[BaseTrainer] Building datasets from config...")
 
-            dataset_path = BASE_DIR / "data" / "medical_data" / "base" / "base_model.csv"
+            dataset_path = BASE_DIR / "data" / "animal" / "base" / "base_model.csv"
             train_dataset, val_dataset, test_dataset, vocab, label2id = DatasetBuilder.build_dataset(
                 path=dataset_path,
                 max_len=cfg.max_seq_len,
@@ -79,9 +79,9 @@ class BaseTrainer:
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size) if test_dataset else None
 
         # --- KG dir ---
-        self.kg_dir = BASE_DIR / "knowledge_graph"
+        self.kg_dir = BASE_DIR / "knowledge_graph" if not kg_dir else Path(kg_dir)
         self.kg_dir.mkdir(parents=True, exist_ok=True)
-        self.ttl_path = ttl_path if ttl_path else BASE_DIR / "data" / "medical_data" / "base" / "human_body_knowledge_graph.ttl"
+        self.ttl_path = ttl_path if ttl_path else BASE_DIR / "data" / "animal" / "base" / "animal_kg.cleaned.ttl"
 
         # --- Loss and optimizer ---
         self.criterion = nn.CrossEntropyLoss()
@@ -116,7 +116,7 @@ class BaseTrainer:
     def _ensure_kg_embeddings(self, vocab=None):
         """
         Ensure KG embeddings exist, else train them.
-        Then inject them into the model's embeddings using vocab ↔ KG alignment.
+        Then inject them into the model's embeddings using vocab with KG alignment.
         """
         if not self.cfg:
             print("[BaseTrainer] No KG config provided, skipping KG integration")
@@ -128,8 +128,7 @@ class BaseTrainer:
             joint_dim=self.cfg.model_dim,
             model_name=self.cfg.kg_model,
             model_kwargs=self.cfg.kg_model_kwargs,
-            lr=self.cfg.kg_lr,
-            adv_temp=self.cfg.adv_temp
+            lr=self.cfg.kg_lr
         )
 
         best_node_path = self.kg_dir / "node_embeddings_best.npy"
@@ -141,7 +140,7 @@ class BaseTrainer:
             # build triples from ontology
             kg_builder = KGBuilder(
                 ttl_path=self.ttl_path,
-                namespace_filter="http://example.org/human_body#"
+                namespace_filter="http://example.org/ontology#"
             )
             triples_id, entity2id, relation2id = kg_builder.build()
             kg_builder.summary()
@@ -159,7 +158,7 @@ class BaseTrainer:
 
             # train embeddings
             kg_trainer.load_triples()
-            kg_trainer.train(epochs=self.cfg.kg_epochs, log_to_wandb=self.use_wandb, num_negatives=self.cfg.kg_neg_samples, batch_size=64)
+            kg_trainer.train(epochs=self.cfg.kg_epochs, log_to_wandb=self.use_wandb, negative_size=self.cfg.kg_neg_samples, batch_size=64)
             kg_trainer.save_embeddings()
         else:
             print("[BaseTrainer] Using cached KG embeddings")

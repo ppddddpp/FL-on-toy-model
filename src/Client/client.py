@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import os
 import numpy as np
 import json
+from typing import Any, Dict
 
 class Client:
     def __init__(
@@ -41,14 +42,39 @@ class Client:
     # ---------- safe load ----------
     @staticmethod
     def _load_state_safely(model, global_weights):
+        """
+        Safely load global weights into client model.
+        Allows classifier head replacement when shape differs (due to label expansion).
+        """
         model_dict = model.state_dict()
-        filtered = {}
+        new_state = {}
+
         for k, v in global_weights.items():
-            if k in model_dict and model_dict[k].shape == v.shape:
-                filtered[k] = v
+            if k in model_dict:
+                local_shape = model_dict[k].shape
+                global_shape = v.shape
+
+                # --- classifier shape changes are allowed ---
+                if "classifier" in k and local_shape != global_shape:
+                    # Classifier expansion allowed only when global is larger
+                    if global_shape[0] > local_shape[0]:
+                        print(f"[SafeLoad] Expanding classifier {k}: {local_shape} -> {global_shape}")
+                        new_state[k] = v.to(model_dict[k].device)
+                    else:
+                        print(f"[SafeLoad] Ignoring smaller classifier {k}, keeping local shape {local_shape}")
+                    continue
+
+                # normal matching case
+                if local_shape == global_shape:
+                    new_state[k] = v.to(model_dict[k].device)
+                else:
+                    print(f"[SafeLoad] Skipped weight '{k}' due to shape mismatch "
+                        f"{tuple(local_shape)} vs {tuple(global_shape)}")
             else:
-                print(f"[Warning] Skipped weight '{k}' due to shape mismatch.")
-        model_dict.update(filtered)
+                print(f"[SafeLoad] Key '{k}' does not exist in local model, skipping.")
+
+        # update model
+        model_dict.update(new_state)
         model.load_state_dict(model_dict)
         return model
 
@@ -105,8 +131,13 @@ class Client:
         save_path=None,
         log_interval=10
     ):
-        model = self.model_fn().to(self.device)
+        if hasattr(self, "_cached_model"):
+            model = self._cached_model.to(self.device)
+        else:
+            model = self.model_fn().to(self.device)
+
         model = self._load_state_safely(model, global_weights)
+
         if self.use_kg_align:
             model = self._align_classifier_with_kg(model)
 
@@ -144,7 +175,15 @@ class Client:
             torch.save(model.state_dict(), save_path)
             print(f"[{self.client_id}] Saved model to {save_path}")
 
-        return {k: v.cpu() for k, v in model.state_dict().items()}, len(self.dataset)
+        # Update cached global model after local training (for next round)
+        self._cached_model = model.to("cpu")
+        self._cached_global_state = {
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
+        }
+
+        discovered = self.discover_local_labels()
+        return {k: v.cpu() for k, v in model.state_dict().items()}, len(self.dataset), discovered
 
     # ---------- evaluation ----------
     def evaluate(self, weights=None, batch_size=16):
@@ -166,3 +205,55 @@ class Client:
         acc = correct / total if total > 0 else 0.0
         print(f"[{self.client_id}] Evaluation Accuracy: {acc:.4f}")
         return acc
+
+    def discover_local_labels(self) -> Dict[str, Any]:
+        """
+        Returns a dict with:
+          - 'label_ids': set of integer label ids found in the dataset
+          - 'label_names': optional set of label name strings if dataset provides mapping
+        """
+        label_ids = set()
+        # try to iterate dataset quickly (works for TensorDataset of (x,mask,y))
+        try:
+            for _, _, y in DataLoader(self.dataset, batch_size=256):
+                label_ids.update([int(v.item()) for v in y])
+        except Exception:
+            # fallback: try iterating element-wise
+            try:
+                for sample in self.dataset:
+                    y = sample[-1]
+                    label_ids.add(int(y.item()) if torch.is_tensor(y) else int(y))
+            except Exception:
+                pass
+
+        label_names = None
+        # If dataset or client has a mapping (id->name), expose it:
+        if hasattr(self.dataset, "id2label"):
+            label_names = {self.dataset.id2label[i] for i in label_ids if i in self.dataset.id2label}
+        elif hasattr(self, "local_id2label"):
+            label_names = {self.local_id2label[i] for i in label_ids if i in self.local_id2label}
+
+        return {"label_ids": label_ids, "label_names": label_names}
+    
+    def load_global_model(self, global_state: Dict[str, torch.Tensor]):
+        """
+        Called by server when broadcasting an expanded global model 
+        (with new labels / bigger classifier).
+        """
+        model = self.model_fn().to(self.device)
+
+        try:
+            model = self._load_state_safely(model, global_state)
+        except Exception as e:
+            print(f"[{self.client_id}] Safe load failed: {e}")
+            model.load_state_dict(global_state, strict=False)
+
+        # Cache for later local_train
+        self._cached_global_state = {
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
+        }
+        self._cached_model = model
+
+        print(f"[{self.client_id}] Loaded & cached global model.")
+        return True

@@ -1,15 +1,17 @@
 import os
 import torch
 from pathlib import Path
-
-from EnviromentSetup.Trainer.train_base import BaseTrainer
-from DataHandler.dataset_builder import DatasetBuilder
-from Helpers.configLoader import Config
+import random
 from typing import Any
 import time
 import numpy as np
 import csv
 import json
+import copy
+
+from EnviromentSetup.Trainer.train_base import BaseTrainer
+from DataHandler.dataset_builder import DatasetBuilder
+from Helpers.configLoader import Config
 from Framework.SelfCheck import SelfCheckManager
 from Framework.SelfCheck.s5_deep_check.calibration import SafeThresholdCalibrator
 from Framework.SelfCheck.s5_deep_check.deep_check_eval import DeepCheckManager
@@ -27,7 +29,8 @@ ACT_BASELINE.mkdir(parents=True, exist_ok=True)
 class Server:
     def __init__(self, model_cls, 
                     config=None, self_check: Any = None, anchor_loader: Any = None,
-                    checkpoint_dir="checkpoints/base_model", device="cpu", dataset_path=None,
+                    checkpoint_dir="checkpoints/base_model", device="cpu", 
+                    dataset_path=None, ttl_path=None,
                     text_col=None, label_col=None, 
                     log_dir= BASE_DIR / "logs" / "run.txt"):
         
@@ -38,8 +41,13 @@ class Server:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir = log_dir
 
+        torch.manual_seed(self.config.seed if hasattr(self.config, 'seed') else 2709)
+        np.random.seed(self.config.seed if hasattr(self.config, 'seed') else 2709)
+        random.seed(self.config.seed if hasattr(self.config, 'seed') else 2709)
+
         # Dataset set up for base model
         self.dataset_path = BASE_DIR / "data" / "animal" / "base" / "base_model.csv" if dataset_path is None else dataset_path
+        self.ttl_path = BASE_DIR / "data" / "animal" / "base" / "animal_kg.cleaned.ttl" if ttl_path is None else ttl_path
         self.text_col = "text" if text_col is None else text_col
         self.label_col = "label" if label_col is None else label_col
 
@@ -96,6 +104,26 @@ class Server:
             except Exception as e:
                 log_and_print(f"[Server] Failed to load KG: {e}", log_file=self.log_dir)
 
+            # Normalize KG embeddings (if any)
+            if entity_embeddings is not None:
+                with torch.no_grad():
+                    norms = entity_embeddings.norm(p=2, dim=1, keepdim=True) + 1e-12
+                    entity_embeddings = entity_embeddings / norms
+                log_and_print("[KG] Normalized entity_embeddings (L2).", log_file=self.log_dir)
+
+            # Normalize label-to-entity map
+            if label_map:
+                cleaned_map = {}
+                for k, v in label_map.items():
+                    cleaned_map[k] = v.strip().lower().replace(" ", "_")
+                label_map = cleaned_map
+                log_and_print(f"[KG] Normalized label_map keys: {label_map}", log_file=self.log_dir)
+
+            # Normalize KG triples (remove duplicates, ensure integer type)
+            if kg_edges:
+                kg_edges = {(int(h), int(t)) for (h, t) in kg_edges}
+                log_and_print(f"[KG] Cleaned KG edges: {len(kg_edges)} triples loaded.", log_file=self.log_dir)
+
             # Hybrid KG evaluator: supports both symbolic triples + learned embeddings
             self.kg_eval = KGConsistencyEvaluator(
                 kg_edges=kg_edges,
@@ -139,6 +167,33 @@ class Server:
             )
         except Exception as e:
             log_and_print(f"[Server] Activation baseline setup failed: {e}", log_file=self.log_dir)
+
+        # --- Calibrate anchor running std for AnchorEvaluator (empirical sigma) ---
+        try:
+            anchor_eval_obj = None
+            # prefer the anchor evaluator used by DeepCheckManager
+            if hasattr(self, "deep_check") and getattr(self.deep_check, "anchor_eval", None) is not None:
+                anchor_eval_obj = self.deep_check.anchor_eval
+            # fallback to self.act if available
+            elif getattr(self, "act", None) is not None and hasattr(self.act, "calibrate_running_std"):
+                anchor_eval_obj = self.act
+            else:
+                anchor_eval_obj = None
+
+            if anchor_eval_obj is not None and getattr(anchor_eval_obj, "anchor_loader", None) is not None:
+                log_and_print("[Server] Starting anchor running_std calibration...", log_file=self.log_dir)
+                # calibrate_running_std(global_model, n_trials=8, noise_scale=1e-3, device=None (auto))
+                anchor_eval_obj.calibrate_running_std(
+                    global_model=self.global_model,
+                    n_trials=8,
+                    noise_scale=1e-3,
+                    device=None
+                )
+                log_and_print("[Server] Anchor running_std calibrated successfully.", log_file=self.log_dir)
+            else:
+                log_and_print("[Server] Anchor calibration skipped: no anchor evaluator/loader available.", log_file=self.log_dir)
+        except Exception as e:
+            log_and_print(f"[Server] Anchor calibrate failed: {e}", log_file=self.log_dir)
 
         self.global_ref_sig = None       # torch.Tensor or None
         self.global_ref_alpha = 0.1      # EMA update rate for global ref sig
@@ -209,6 +264,7 @@ class Server:
                 lr=self.config.lr,
                 cfg=self.config,
                 use_wandb=False,
+                ttl_path=self.ttl_path,
                 device=str(self.device)
             )
             trainer.train(epochs=self.config.epochs)
@@ -437,15 +493,48 @@ class Server:
         model_dict = model.state_dict()
         compatible = {}
         for k, v in state_dict.items():
-            if k in model_dict and model_dict[k].shape == v.shape:
-                compatible[k] = v.to(model_dict[k].device)
+            if k in model_dict:
+                expected = model_dict[k]
+
+                # --- classifier head mismatch (dynamic label expansion) ---
+                if "classifier" in k and expected.shape != v.shape:
+
+                    exp_rows = expected.shape[0]
+                    cli_rows = v.shape[0]
+
+                    # Case 1: client classifier is SMALLER: ignore it
+                    if cli_rows < exp_rows:
+                        log_and_print(
+                            f"[SafeLoad] Ignoring smaller client classifier {k}: "
+                            f"client={tuple(v.shape)} < global={tuple(expected.shape)}",
+                            log_file=self.log_dir
+                        )
+                        continue
+
+                    # Case 2: client classifier is LARGER: expand the server model
+                    if cli_rows > exp_rows:
+                        log_and_print(
+                            f"[SafeLoad] Expanding global classifier {k}: "
+                            f"{tuple(expected.shape)} -> {tuple(v.shape)}",
+                            log_file=self.log_dir
+                        )
+                        compatible[k] = v.to(expected.device)
+                        continue
+
+                # normal matching case
+                if expected.shape == v.shape:
+                    compatible[k] = v.to(expected.device)
+                else:
+                    log_and_print(
+                        f"[SafeLoad] Skipping {k}: expected {tuple(expected.shape)}, "
+                        f"got {tuple(v.shape)}",
+                        log_file=self.log_dir
+                    )
             else:
-                log_and_print(f"[SafeLoad] Skipping {k}: shape {getattr(v, 'shape', None)}", log_file=self.log_dir)
-                log_and_print(f" expected {model_dict.get(k).shape if k in model_dict else 'MISSING'}", log_file=self.log_dir)
+                log_and_print(f"[SafeLoad] Key {k} missing in model_dict", log_file=self.log_dir)
         
         model.load_state_dict(compatible, strict=False)
         log_and_print(f"[SafeLoad] Loaded {len(compatible)} params (strict=False).", log_file=self.log_dir)
-
 
         model_dict.update(compatible)
         model.load_state_dict(model_dict)
@@ -484,8 +573,8 @@ class Server:
         log_and_print(f"[Server] Expanding classifier: old weight shape = {old_shape}", log_file=self.log_dir)
 
         # --- Determine orientation more robustly ---
-        # if first dim == old num_labels → row_labels orientation
-        # if second dim == old num_labels → col_labels orientation
+        # if first dim == old num_labels to row_labels orientation
+        # if second dim == old num_labels to col_labels orientation
         old_num_labels = len(current_labels)
         if old_shape[0] == old_num_labels:
             orientation = "row_labels"
@@ -545,7 +634,16 @@ class Server:
             # Expand classifier if allowed
             if self.share_label_space:
                 self.sync_labels_and_expand_model(client_label_sets)
-                log_and_print("[Server] Label space expanded globally and shared with all clients.", log_file=self.log_dir)
+
+                # Broadcast expanded model to all clients
+                expanded_state = copy.deepcopy(self.global_model.state_dict())
+                for cu in client_updates:
+                    client_obj = cu.get("client_obj", None)
+                    if client_obj is not None:
+                        try:
+                            client_obj.load_global_model(expanded_state)
+                        except Exception as e:
+                            log_and_print(f"[Server] Warning: failed to broadcast expanded model to {cu['client_id']}: {e}", log_file=self.log_dir)
             else:
                 # Privacy-preserving mode — expand internally only
                 private_label_union = set().union(*client_label_sets)
@@ -738,5 +836,9 @@ class Server:
 
         log_and_print(f"[Server] Round {round_id} completed | Aggregated {len(agg_inputs)} clients.", log_file=self.log_dir)
 
+        save_path = os.path.join(BASE_DIR / "logs", "label2id_dynamic.json")
+        with open(save_path, "w") as f:
+            json.dump(self.base_label2id, f, indent=2)
 
+        print(f"[Server] Saved updated label mapping to {save_path}")
         return public_out

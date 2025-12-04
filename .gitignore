@@ -185,6 +185,7 @@ cython_debug/
 # Ignore large size folders 
 logs
 data
+best
 backup
 eda_results
 knowledge_graph

@@ -335,7 +335,7 @@ def main():
                     print(f"[WARN] DATA-ATTACKS {client_id}: {e}")
 
             # Local training
-            new_weights, num_samples = client_obj.local_train(
+            new_weights, num_samples, discovered = client_obj.local_train(
                 global_weights=global_weights,
                 epochs=local_epochs,
                 batch_size=cfg.batch_size,
@@ -403,6 +403,7 @@ def main():
                 "delta": delta,
                 "num_samples": num_samples,
                 "labels": list(cb["label2id"].keys()),
+                "discovered": discovered, 
             })
 
             per_client_metrics.append({

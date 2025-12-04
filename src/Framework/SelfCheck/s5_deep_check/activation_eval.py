@@ -596,21 +596,39 @@ class ActivationOutlierDetector:
             return False
 
         acts = torch.cat(activations, dim=0).numpy()
-        # For baselin save per-batch zmax array for calibration convenience:
-        # compute zmax per-slice (coarse: here compute single zmax across all activations)
-        col_mean = acts.mean(axis=0)
-        col_std = acts.std(axis=0)
-        col_std = np.maximum(col_std, 1e-6)
-        acts_z = np.abs((acts - col_mean) / col_std)
-        zmax_all = float(np.nan_to_num(np.nanmax(acts_z), nan=0.0))
 
-        # Save baseline summary + optionally the zmax array (single value here).
-        np.savez(save_path,
-                    mean=np.mean(acts, axis=0),
-                    std=np.std(acts, axis=0),
-                    cov=np.cov(acts, rowvar=False),
-                    zmax=np.array([zmax_all], dtype=np.float32))
-        print(f"[ActivationOutlierDetector] Baseline saved to {save_path} (zmax={zmax_all:.3f})")
+        # Compute per-batch zmax values instead of a single scalar
+        batch_size = 64  # You can also use anchor_loader.batch_size if you prefer
+        zmax_list = []
+        N = acts.shape[0]
+        start = 0
+
+        while start < N:
+            end = min(start + batch_size, N)
+            batch = acts[start:end]
+
+            # Compute z-scores for this batch
+            col_mean = batch.mean(axis=0)
+            col_std = batch.std(axis=0)
+            col_std = np.maximum(col_std, 1e-6)
+
+            z = np.abs((batch - col_mean) / col_std)
+            zmax_batch = float(np.nan_to_num(np.nanmax(z), nan=0.0))
+            zmax_list.append(zmax_batch)
+
+            start = end
+
+        # Save full activation stats + the zmax distribution
+        np.savez(
+            save_path,
+            mean=np.mean(acts, axis=0),
+            std=np.std(acts, axis=0),
+            cov=np.cov(acts, rowvar=False),
+            zmax=np.array(zmax_list, dtype=np.float32)
+        )
+
+        print(f"[ActivationOutlierDetector] Baseline saved to {save_path} "
+            f"(zmax distribution size={len(zmax_list)})")
         return True
 
     def load_baseline(self, path="baseline_activation_stats.npz"):

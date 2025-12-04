@@ -10,6 +10,7 @@ class Config:
     patience: int = 2
     batch_size: int = 2
     lr: float = 2e-5
+    seed: int = 2709
 
     # Model parameters
     max_seq_len: int = 128
